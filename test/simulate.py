@@ -12,7 +12,8 @@ grenedalf), so grenedalf_optimiser.py can be tested without BAMs. Used by run_te
 
 Built in: an N gap and a soft-masked block (chr1), a non-unique block (chr1), a collapsed
 repeat at 4x depth in every pool (chr1), an ambiguous-mapping block where most reads
-have MAPQ 0 (chr2), a deletion in pool B only (chr2), X at half depth, and a mitochondrion
+have MAPQ 0 (chr2), a deletion in pool B only (chr2), X at 0.6-0.8x autosome depth (mixed-sex
+pools; X_RATIO), and a mitochondrion
 that should be excluded.
 """
 
@@ -24,6 +25,8 @@ import pandas as pd
 
 CHROMS = {"sim_chr1": 300_000, "sim_chr2": 200_000, "sim_chrX": 150_000, "mito": 15_000}
 POOLS = {"poolA_L3": 40, "poolB_L3": 80, "poolC_L3": 120, "poolD_L3": 60, "poolE_L3": 100, "poolF_L3": 140}
+# X depth relative to autosomes = 1 - (male fraction)/2: mixed-sex pools, mostly near 50:50
+X_RATIO = {"poolA_L3": 0.75, "poolB_L3": 0.75, "poolC_L3": 0.7, "poolD_L3": 0.8, "poolE_L3": 0.75, "poolF_L3": 0.6}
 LD_SCALE = 2000  # bp; correlation of pool frequency deviations decays as exp(-d / LD_SCALE)
 BIN = 1000
 rng = np.random.default_rng(1)
@@ -33,7 +36,7 @@ def smooth_noise(n, sd, step=1000, span=5):
     """Smooth random log-scale variation along a chromosome."""
     k = n // step + 1
     x = np.convolve(rng.normal(0, sd, k + span), np.ones(span) / np.sqrt(span), "same")[:k]
-    return np.repeat(x, step)[:n]
+    return np.repeat(x - x.mean(), step)[:n]  # centred: no chromosome-wide offset
 
 
 def depth_arrays():
@@ -43,7 +46,7 @@ def depth_arrays():
     shared = {c: smooth_noise(n, 0.25) for c, n in CHROMS.items()}
     for p, mean in POOLS.items():
         for c, n in CHROMS.items():
-            mu = np.full(n, mean / 2 if c == "sim_chrX" else mean, float)
+            mu = np.full(n, mean * X_RATIO[p] if c == "sim_chrX" else mean, float)
             mu *= np.exp(shared[c] + smooth_noise(n, 0.08))
             if c == "mito":
                 mu[:] = mean * 50

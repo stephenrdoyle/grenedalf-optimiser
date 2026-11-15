@@ -45,6 +45,7 @@ X_REGEX='chrX|_X_|^X$'
 MITO_REGEX='mitochondri|^chrM$|^MT$|mtDNA'
 REGION=               # empty: whole genome (recommended); or a grenedalf --filter-region for a quick trial
 POOL_SIZES=           # per-pool sizes, POOL=N,POOL=N (overrides POOL_SIZE)
+MALE_FRACTION=        # known male fraction (0.5 for 50:50), or POOL=m,...; empty = estimate from X depth
 MAPQ=30
 BASEQ=30
 MIN_FOLD=0.5
@@ -189,6 +190,7 @@ step_chromclass() {
     for n in "${NAMES[@]}"; do a+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz"); done
     "${OPTIMISER[@]}" chromclass "${a[@]}" --fai "$FAI" --mask-bed "$MASK_BED" --chrom-regex "$CHROM_REGEX" \
         --x-regex "$X_REGEX" --mito-regex "$MITO_REGEX" --pool-sizes "$POOL_SPEC" \
+        ${MALE_FRACTION:+--male-fraction "$MALE_FRACTION"} \
         --min-fold "$MIN_FOLD" --max-fold "$MAX_FOLD" --abs-min-depth "$ABS_MIN_DEPTH" --out "$P"
 }
 

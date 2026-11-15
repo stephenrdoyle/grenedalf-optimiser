@@ -557,10 +557,10 @@ def section_chromclass(P):
         for v in (0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1):
             g.append(f'<line class="gl" x1="{sx(v):.1f}" x2="{sx(v):.1f}" y1="22" y2="{h - 26}"/>'
                      f'<text class="tick" x="{sx(v):.1f}" y="{h - 10}" text-anchor="middle">{v:.1f}</text>')
-        for v, lab in ((1.0, "no males (X like autosomes)"), (0.5, "all males")):
+        for v, lab, anchor in ((1.0, "no males", "end"), (0.75, "50:50", "middle"), (0.5, "all males", "start")):
             g.append(f'<line x1="{sx(v):.1f}" x2="{sx(v):.1f}" y1="18" y2="{h - 26}" stroke="var(--ink2)" stroke-width="1"/>'
-                     f'<text class="ref" x="{sx(v) + (-4 if v == 1.0 else 4):.1f}" y="14" '
-                     f'text-anchor="{"end" if v == 1.0 else "start"}">{lab}</text>')
+                     f'<text class="ref" x="{sx(v) + {"end": -4, "start": 4, "middle": 0}[anchor]:.1f}" y="14" '
+                     f'text-anchor="{anchor}">{lab}</text>')
         for i, r in enumerate(x.itertuples()):
             y = 34 + i * rowh
             col = "var(--s2)" if r.differs else "var(--s1)"
@@ -568,7 +568,8 @@ def section_chromclass(P):
             g.append(f'<line x1="{sx(r.ci_low):.1f}" x2="{sx(r.ci_high):.1f}" y1="{y}" y2="{y}" stroke="{col}" '
                      f'stroke-width="2" stroke-linecap="round"/>')
             tip = (f"{r.pool}: X/autosome depth {r.ratio_to_A:.3f} (95% {r.ci_low:.3f}–{r.ci_high:.3f}); "
-                   f"est. male fraction {r.male_fraction_est:.2f}; X pool size {r.pool_size:g}")
+                   f"male fraction est. {r.male_fraction_est:.2f}, used {r.male_fraction_used:.2f}; "
+                   f"X pool size {r.pool_size:g}")
             g.append(f'<circle cx="{sx(r.ratio_to_A):.1f}" cy="{y}" r="5" fill="{col}" stroke="var(--surface)" stroke-width="2"/>'
                      f'<circle cx="{sx(r.ratio_to_A):.1f}" cy="{y}" r="11" fill="transparent"><title>{esc(tip)}</title></circle>')
         g.append(f'<text class="alabel" x="{(ml + w - 20) / 2:.0f}" y="{h + 6}" text-anchor="middle">'
@@ -580,11 +581,22 @@ def section_chromclass(P):
         verdict = (f'<p class="status">{ICON_INFO if sep else ICON_OK}'
                    + ("Analyse the X separately, with its own pool sizes" if sep else "The X can be analysed with the autosomes")
                    + "</p>")
-        tx = x[["pool", "ratio_to_A", "ci_low", "ci_high", "male_fraction_est", "pool_size"]].copy()
-        tx.columns = ["pool", "X / autosome depth", "95% low", "95% high", "est. male fraction", "X pool size"]
+        cols = ["pool", "ratio_to_A", "ci_low", "ci_high", "male_fraction_est", "male_fraction_ci"]
+        names_ = ["pool", "X / autosome depth", "95% low", "95% high", "male fraction (est.)", "95% interval"]
+        known = "male_fraction_known" in x and x["male_fraction_known"].notna().any()
+        if known:
+            cols += ["male_fraction_known", "matches_known"]
+            names_ += ["male fraction (known)", "estimate consistent"]
+        tx = x[cols + ["pool_size"]].copy()
+        tx.columns = names_ + ["X pool size"]
+        if known and not x["matches_known"].fillna(True).astype(bool).all():
+            verdict += ('<p class="status">' + ICON_BAD + "X depth does not match the known sex ratio in at least one "
+                        "pool: check the pool composition, or X mappability</p>")
         parts.append("<h3>X chromosome</h3><p>Males carry one X, so in a pool with males the X has lower depth and "
                      "is sampled from fewer copies. With a fraction <em>m</em> of males, X depth / autosome depth = "
-                     "1 − <em>m</em>/2, and the X pool size is the pool size × (1 − <em>m</em>/2). If any pool "
+                     "1 − <em>m</em>/2 (0.75 for a 50:50 pool), and the X pool size is the pool size × (1 − <em>m</em>/2). "
+                     "The male fraction is estimated from the depth ratio, or taken from <code>MALE_FRACTION</code> when the "
+                     "sex ratio is known, with the estimate kept as a check. If any pool "
                      "differs from 1 (interval excluding it, by more than 5%), the X gets its own grenedalf run with "
                      "these pool sizes; otherwise the autosomal pool size would be wrong for the X.</p>"
                      + legend + svg + verdict + plain_table(tx))

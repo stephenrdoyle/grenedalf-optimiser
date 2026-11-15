@@ -684,6 +684,9 @@ def cmd_chromclass(args):
     X: in a pool with males (hemizygous), X depth is below autosome depth, and the X is
     sampled from fewer copies, so grenedalf needs a smaller X pool size: with a fraction m
     of males, X depth / autosome depth = 1 - m/2, and the X pool size is pool_size * (1 - m/2).
+    A 50:50 pool gives 0.75. m is estimated from the depth ratio unless given with
+    --male-fraction (known from the design), in which case the known value sets the X pool
+    size and the estimate is reported as a check (consistent if its interval contains 1 - m/2).
     If any pool's ratio differs from 1 (95% interval excludes it, by more than
     --min-difference), the X is run separately with its own pool sizes.
     Mitochondrion: haploid, many copies per cell, one lineage per individual: always run
@@ -692,6 +695,7 @@ def cmd_chromclass(args):
     fai = read_fai(args.fai)
     mask = merge_intervals(read_bed(args.mask_bed)) if args.mask_bed else None
     sizes = parse_pool_sizes(args.pool_sizes, [n for n, _ in args.depth])
+    known_m = parse_pool_sizes(args.male_fraction, [n for n, _ in args.depth])
     rng = np.random.default_rng(args.seed)
 
     def chrom_class(c):
@@ -735,8 +739,17 @@ def cmd_chromclass(args):
                    "ratio_to_A": round(ratio, 4), "ci_low": round(float(lo), 4), "ci_high": round(float(hi), 4),
                    "differs": differs}
             if cls == "X":
-                m = float(np.clip(2 * (1 - ratio), 0, 1))
-                row["male_fraction_est"] = round(m, 3)
+                m_est = float(np.clip(2 * (1 - ratio), 0, 1))
+                row["male_fraction_est"] = round(m_est, 3)
+                row["male_fraction_ci"] = f"{np.clip(2 * (1 - hi), 0, 1):.2f}-{np.clip(2 * (1 - lo), 0, 1):.2f}"
+                if name in known_m:
+                    m = known_m[name]
+                    row["male_fraction_known"] = m
+                    row["expected_ratio"] = round(1 - m / 2, 4)
+                    row["matches_known"] = bool(lo <= 1 - m / 2 <= hi)
+                else:
+                    m = m_est
+                row["male_fraction_used"] = round(m, 3)
                 row["pool_size"] = round(n * (1 - m / 2)) if np.isfinite(n) else np.nan
             else:
                 row["pool_size"] = round(n / 2) if np.isfinite(n) else np.nan
@@ -1234,6 +1247,8 @@ def main():
     p.add_argument("--x-regex", default=r"chrX|_X_|^X$")
     p.add_argument("--mito-regex", default=r"mitochondri|^chrM$|^MT$|mtDNA")
     p.add_argument("--pool-sizes", help="haploid genomes per pool: one number, or POOL=N,POOL=N")
+    p.add_argument("--male-fraction", help="known fraction of males per pool: one number, or POOL=m,POOL=m "
+                   "(default: estimated from X depth)")
     p.add_argument("--min-difference", type=float, default=0.05,
                    help="smallest |ratio - 1| treated as a real difference [0.05]")
     p.add_argument("--min-fold", type=float, default=0.5)

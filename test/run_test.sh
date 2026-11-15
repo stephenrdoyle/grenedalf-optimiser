@@ -64,8 +64,8 @@ grep -q $'^sim_chr1\t100000\t110000\tcollapsed$' "$D/optimiser.mask_reasons.bed"
 awk -F'\t' '$1=="sim_chr2" && $2>=150000 && $3<=155000 && $4=="poolB_L3"' "$D/optimiser.pool_specific_depth.tsv" | grep -q . \
     || fail "pool-specific deletion in poolB not reported"
 grep -q $'^sim_chr2\t150000\t155000' "$D/optimiser.mask.bed" && fail "pool-specific deletion was masked for all pools"
-awk -F'\t' 'NR>1 && $1=="poolA_L3" && $2=="X" && $4 >= 17 && $4 <= 23 {ok=1} END {exit !ok}' "$D/optimiser.depth_thresholds.tsv" \
-    || fail "poolA X median not ~20"
+awk -F'\t' 'NR>1 && $1=="poolA_L3" && $2=="X" && $4 >= 26 && $4 <= 34 {ok=1} END {exit !ok}' "$D/optimiser.depth_thresholds.tsv" \
+    || fail "poolA X median not ~30 (0.75 x 40)"
 grep -q "OK: grenedalf masked" "$D/optimiser.windows.txt" || fail "mask orientation check"
 grep -q "RECOMMENDED_RUN=clean" "$D/optimiser.assess.params" || fail "assess should prefer the clean run"
 awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 && $1=="artefact" {exit !($h["artefact_vs_strict"] > 0.2)}' \
@@ -77,10 +77,20 @@ source "$D/optimiser.ld.params"
 source "$D/optimiser.windows.params"
 [[ $WINDOW -ge $LD_D10 ]] || fail "window $WINDOW narrower than the linkage scale $LD_D10"
 
-# X simulated at half depth (all males): separate run, X pool size 200; mito always separate
+# X simulated at 0.6-0.8x autosome depth (mixed-sex pools): separate run, X pool size = 400 x ratio
+# (300 for 50:50); mito always separate
 source "$D/optimiser.chromclass.params"
 [[ $X_SEPARATE == 1 && $MITO_SEPARATE == 1 ]] || fail "X / mito not flagged for separate runs"
-awk -F'\t' '$2 < 180 || $2 > 220 {bad=1} END {exit bad}' "$D/optimiser.x_pool_sizes.tsv" || fail "X pool sizes not ~200"
+awk -F'\t' 'BEGIN {r["poolA_L3"]=.75; r["poolB_L3"]=.75; r["poolC_L3"]=.7; r["poolD_L3"]=.8; r["poolE_L3"]=.75; r["poolF_L3"]=.6}
+    {e = 400 * r[$1]; if ($2 < 0.9 * e || $2 > 1.1 * e) bad = 1} END {exit bad}' "$D/optimiser.x_pool_sizes.tsv" \
+    || fail "X pool sizes not 400 x simulated X ratio: $(tr '\n' ' ' < "$D/optimiser.x_pool_sizes.tsv")"
+# Known 50:50 design: X pool size 300 everywhere; poolF (simulated 0.6, i.e. 80% males) flagged as inconsistent
+"${OPTIMISER[@]}" chromclass "${c[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --chrom-regex sim_ \
+    --mito-regex mito --pool-sizes 400 --male-fraction 0.5 --out "$D/known" > /dev/null
+awk -F'\t' '$2 != 300 {bad=1} END {exit bad}' "$D/known.x_pool_sizes.tsv" || fail "known 50:50 did not give X pool size 300"
+awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} $2=="X" {m[$1]=$h["matches_known"]}
+    END {exit !(m["poolA_L3"]=="True" && m["poolF_L3"]=="False")}' "$D/known.chrom_classes.tsv" \
+    || fail "known sex ratio consistency check"
 for run in autosomes X mito; do
     grep -q -- "--out-dir \$OUTDIR/$run " "$D/grenedalf_commands.sh" || fail "no $run run in grenedalf_commands.sh"
 done
