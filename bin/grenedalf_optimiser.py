@@ -50,7 +50,7 @@ import pandas as pd
 
 # Mask reasons as bit flags, so a base can carry more than one
 FLAGS = {
-    "excluded": 1,         # chromosome not matching --chrom-regex (e.g. mitochondrion, unplaced)
+    "excluded": 1,         # not in the nuclear analysis: --exclude-chroms (mitochondrion) or not --chrom-regex
     "gap": 2,              # N in the reference
     "softmask": 4,         # lower case in the reference (only with --softmask)
     "low_mappability": 8,  # most k-mers overlapping the base are not unique (GenMap)
@@ -158,6 +158,11 @@ def normalise_by_chrom(df, col):
     return df[col] / med
 
 
+def name_list(spec):
+    """Contig names from "a,b,c" (spaces allowed); empty or None -> empty set."""
+    return {x.strip() for x in str(spec or "").split(",") if x.strip()}
+
+
 def parse_pool_sizes(spec, names):
     """Pool size (haploid genomes) per pool, from "400" or "POOL=400,POOL2=380"."""
     if spec is None or str(spec).strip() == "":
@@ -249,6 +254,7 @@ def consensus_depth_flags(depth_args, max_norm, min_norm, min_ratio):
 def cmd_mask(args):
     fai = read_fai(args.fai)
     keep = re.compile(args.chrom_regex)
+    exclude = name_list(args.exclude_chroms)
 
     genmap = {}
     if args.genmap:
@@ -282,7 +288,7 @@ def cmd_mask(args):
                 sys.exit(f"{chrom} is in the FASTA but not in {args.fai}")
             length = int(lengths[chrom])
             flags = np.zeros(length, np.uint8)
-            if not keep.search(chrom):
+            if chrom in exclude or not keep.search(chrom):
                 flags[:] = FLAGS["excluded"]
             else:
                 if seq is not None:
@@ -398,7 +404,7 @@ def read_samtools_stats(path):
 
 
 def cmd_thresholds(args):
-    xre = re.compile(args.x_regex)
+    x_chroms = name_list(args.x_chroms)
     summary = pd.read_csv(args.mask_summary, sep="\t", dtype={"chrom": str})
     weights = dict(zip(summary["chrom"], summary["accessible"]))
     min_folds = sorted(set(args.grid_min_folds) | {args.min_fold})
@@ -409,7 +415,7 @@ def cmd_thresholds(args):
         pmfs = read_dist(path)
         by_class = {}
         for chrom, pmf in pmfs.items():
-            cls = "X" if xre.search(chrom) else "A"
+            cls = "X" if chrom in x_chroms else "A"
             classes[chrom] = cls
             w = float(weights.get(chrom, 0))
             if w <= 0:
@@ -690,7 +696,7 @@ def cmd_chromclass(args):
     --min-difference), the X is run separately with its own pool sizes.
     Mitochondrion: haploid, many copies per cell, one lineage per individual: always run
     separately, with its own depth bounds and a pool size of the number of individuals."""
-    xre, mre, keep = re.compile(args.x_regex), re.compile(args.mito_regex), re.compile(args.chrom_regex)
+    x_chroms, mito_chroms, keep = name_list(args.x_chroms), name_list(args.mito_chroms), re.compile(args.chrom_regex)
     fai = read_fai(args.fai)
     mask = merge_intervals(read_bed(args.mask_bed)) if args.mask_bed else None
     sizes = parse_pool_sizes(args.pool_sizes, [n for n, _ in args.depth])
@@ -698,11 +704,11 @@ def cmd_chromclass(args):
     rng = np.random.default_rng(args.seed)
 
     def chrom_class(c):
-        if mre.search(c):
+        if c in mito_chroms:
             return "M"
         if not keep.search(c):
             return None
-        return "X" if xre.search(c) else "A"
+        return "X" if c in x_chroms else "A"
 
     rows, mito_bounds = [], {}
     for name, path in args.depth:
@@ -760,7 +766,7 @@ def cmd_chromclass(args):
     x = t[t["class"] == "X"]
     m = t[t["class"] == "M"]
     params = {"X_SEPARATE": int(bool(x["differs"].any())) if len(x) else 0,
-              "MITO_CHROMS": ",".join(c for c in fai["chrom"] if mre.search(c))}
+              "MITO_CHROMS": ",".join(c for c in fai["chrom"] if c in mito_chroms)}
     if len(x) and x["pool_size"].notna().all():
         with open(f"{args.out}.x_pool_sizes.tsv", "w") as fh:
             for r in x.itertuples():
@@ -794,9 +800,9 @@ def cmd_commands(args):
         with open(f"{P}.chromclass.params") as fh:
             cc = dict(l.strip().split("=", 1) for l in fh if "=" in l)
     fai = read_fai(args.fai)
-    xre = re.compile(args.x_regex)
     mito = [c for c in cc.get("MITO_CHROMS", "").split(",") if c]
-    x_chroms = [c for c in fai["chrom"] if xre.search(c) and c not in mito]
+    named_x = name_list(args.x_chroms)
+    x_chroms = [c for c in fai["chrom"] if c in named_x and c not in mito]
     x_sep = cc.get("X_SEPARATE", "0") == "1" and x_chroms
     base = merge_intervals(read_bed(args.total_mask))
     whole = lambda chroms: fai[fai["chrom"].isin(chroms)].assign(start=0).rename(columns={"length": "end"})[
@@ -1193,7 +1199,9 @@ def main():
                    help="consensus depth / chromosome median below which a bin is masked as low depth [0.25]")
     p.add_argument("--min-mq-ratio", type=float, default=0.5,
                    help="consensus depth at MAPQ cut-off / depth at MAPQ 0 below which a bin is ambiguous [0.5]")
-    p.add_argument("--chrom-regex", default=".", help="chromosomes to analyse; others are masked [all]")
+    p.add_argument("--exclude-chroms", default="", help="contigs left out of the nuclear analysis, comma "
+                   "separated (the mitochondrion: it gets its own run)")
+    p.add_argument("--chrom-regex", default=".", help="optionally, only contigs matching this are analysed [all]")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_mask)
 
@@ -1202,7 +1210,8 @@ def main():
                    help="mosdepth .mosdepth.region.dist.txt from --by accessible.bed; repeat per pool")
     p.add_argument("--mask-summary", required=True, help="<out>.mask_summary.tsv from the mask step")
     p.add_argument("--stats", nargs=2, action="append", metavar=("POOL", "SAMTOOLS_STATS"))
-    p.add_argument("--x-regex", default=r"chrX|_X_|^X$", help="X chromosome name pattern")
+    p.add_argument("--x-chroms", default="", help="sex chromosome (X or Z) contig names, comma separated; "
+                   "all other contigs are autosomal")
     p.add_argument("--min-fold", type=float, default=0.5, help="lower depth bound = fold x median [0.5]")
     p.add_argument("--max-fold", type=float, default=2.0, help="upper depth bound = fold x median [2.0]")
     p.add_argument("--abs-min-depth", type=int, default=10, help="lower bound never below this [10]")
@@ -1249,9 +1258,9 @@ def main():
                    help="mosdepth bins at the MAPQ cut-off; repeat per pool")
     p.add_argument("--fai", required=True)
     p.add_argument("--mask-bed", help="accessibility mask (bins mostly masked are ignored)")
-    p.add_argument("--chrom-regex", default=".", help="analysed nuclear chromosomes")
-    p.add_argument("--x-regex", default=r"chrX|_X_|^X$")
-    p.add_argument("--mito-regex", default=r"mitochondri|^chrM$|^MT$|mtDNA")
+    p.add_argument("--chrom-regex", default=".", help="optionally, only contigs matching this are analysed [all]")
+    p.add_argument("--x-chroms", default="", help="sex chromosome (X or Z) contigs, comma separated")
+    p.add_argument("--mito-chroms", default="", help="mitochondrial contigs, comma separated")
     p.add_argument("--pool-sizes", help="haploid genomes per pool: one number, or POOL=N,POOL=N")
     p.add_argument("--male-fraction", help="known fraction of males per pool: one number, or POOL=m,POOL=m "
                    "(default: estimated from X depth)")
@@ -1271,7 +1280,7 @@ def main():
     p.add_argument("--out-dir", required=True)
     p.add_argument("--fai", required=True)
     p.add_argument("--bam", nargs="+", required=True)
-    p.add_argument("--x-regex", default=r"chrX|_X_|^X$")
+    p.add_argument("--x-chroms", default="", help="sex chromosome contigs, comma separated")
     p.add_argument("--total-mask", required=True)
     p.add_argument("--sample-masks", default="")
     p.add_argument("--pool-size-arg", required=True, help="value for grenedalf --pool-sizes (number or file)")

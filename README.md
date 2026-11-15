@@ -73,7 +73,23 @@ one LSF job when `bsub` is available (queue `LSF_QUEUE`, memory `LSF_MEM`, cores
 
 `check` on its own takes a minute or two and catches most setup problems: tools and
 python packages, grenedalf's options, BAMs and their indexes, BAM contig names against the
-reference, and which contigs the regexes pick up as autosomes, X and mitochondrion.
+reference, and that every contig named in `SEX_CHROMS` / `MITO_CHROMS` exists.
+
+### Naming the sex chromosome and mitochondrion
+
+Name them explicitly, comma separated if there are several contigs:
+
+```bash
+SEX_CHROMS=hcontortus_chrX_Celeg_TT_arrow_pilon
+MITO_CHROMS=mitochondrion
+```
+
+Every other contig is treated as autosomal, and if neither is set, everything is. The
+sex chromosome is the hemizygous one (X, or Z in ZW species): its depth and pool size are
+tested against the autosomes. Do not list a Y or W here; it is absent from half the
+individuals and does not fit that model. Mitochondrial contigs are left out of the
+nuclear analysis and get their own run. `CHROM_REGEX` can optionally restrict the
+analysis to matching contigs (default: all).
 
 Or run one step at a time (`setup check mask profile thresholds chromclass quantize depthmask pilot grid params report`).
 Each step reads what the previous ones wrote in `OUT/`. On the farm, for example:

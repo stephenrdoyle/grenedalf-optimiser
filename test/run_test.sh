@@ -19,17 +19,17 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 depth=()
 for p in "${POOLS[@]}"; do depth+=(--depth "$p" "$D/$p.mq0.regions.bed.gz" "$D/$p.mq30.regions.bed.gz"); done
 "${OPTIMISER[@]}" mask --fai "$D/ref.fa.fai" --ref "$D/ref.fa" --softmask --genmap "$D/genmap.bedgraph" \
-    --kmer 150 --chrom-regex sim_ "${depth[@]}" --out "$D/optimiser"
+    --kmer 150 --exclude-chroms mito "${depth[@]}" --out "$D/optimiser"
 
 "${SIM[@]}" dist "$D"
 a=()
 for p in "${POOLS[@]}"; do a+=(--dist "$p" "$D/$p.mosdepth.region.dist.txt" --stats "$p" "$D/$p.stats"); done
-"${OPTIMISER[@]}" thresholds "${a[@]}" --mask-summary "$D/optimiser.mask_summary.tsv" --pool-sizes 400 --out "$D/optimiser"
+"${OPTIMISER[@]}" thresholds "${a[@]}" --x-chroms sim_chrX --mask-summary "$D/optimiser.mask_summary.tsv" --pool-sizes 400 --out "$D/optimiser"
 
 c=()
 for p in "${POOLS[@]}"; do c+=(--depth "$p" "$D/$p.mq30.regions.bed.gz"); done
-"${OPTIMISER[@]}" chromclass "${c[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --chrom-regex sim_ \
-    --mito-regex mito --pool-sizes 400 --out "$D/optimiser"
+"${OPTIMISER[@]}" chromclass "${c[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --x-chroms sim_chrX \
+    --mito-chroms mito --pool-sizes 400 --out "$D/optimiser"
 
 "${SIM[@]}" quantize "$D"
 q=()
@@ -52,7 +52,7 @@ for p in "${POOLS[@]}"; do r+=(--depth "$p" "$D/$p.mq30.regions.bed.gz"); done
     --strict clean --min-snps 20 --out "$D/optimiser"
 
 "${OPTIMISER[@]}" commands --prefix "$D/optimiser" --out-dir "$D" --fai "$D/ref.fa.fai" \
-    --bam "${POOLS[@]/%/.bam}" --total-mask "$D/optimiser.total_mask.bed" --pool-size-arg 400 \
+    --bam "${POOLS[@]/%/.bam}" --x-chroms sim_chrX --total-mask "$D/optimiser.total_mask.bed" --pool-size-arg 400 \
     --min-count 3 --min-depth 10 --max-depth 282 --window 6000 --stride 3000 --min-snps 50
 
 # --- checks
@@ -85,8 +85,8 @@ awk -F'\t' 'BEGIN {r["poolA_L3"]=.75; r["poolB_L3"]=.75; r["poolC_L3"]=.7; r["po
     {e = 400 * r[$1]; if ($2 < 0.9 * e || $2 > 1.1 * e) bad = 1} END {exit bad}' "$D/optimiser.x_pool_sizes.tsv" \
     || fail "X pool sizes not 400 x simulated X ratio: $(tr '\n' ' ' < "$D/optimiser.x_pool_sizes.tsv")"
 # Known 50:50 design: X pool size 300 everywhere; poolF (simulated 0.6, i.e. 80% males) flagged as inconsistent
-"${OPTIMISER[@]}" chromclass "${c[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --chrom-regex sim_ \
-    --mito-regex mito --pool-sizes 400 --male-fraction 0.5 --out "$D/known" > /dev/null
+"${OPTIMISER[@]}" chromclass "${c[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --x-chroms sim_chrX \
+    --mito-chroms mito --pool-sizes 400 --male-fraction 0.5 --out "$D/known" > /dev/null
 awk -F'\t' '$2 != 300 {bad=1} END {exit bad}' "$D/known.x_pool_sizes.tsv" || fail "known 50:50 did not give X pool size 300"
 awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} $2=="X" {m[$1]=$h["matches_known"]}
     END {exit !(m["poolA_L3"]=="True" && m["poolF_L3"]=="False")}' "$D/known.chrom_classes.tsv" \
@@ -101,5 +101,16 @@ grep -q -- "--no-tajima-d" "$D/grenedalf_commands.sh" || fail "diversity at min 
 awk '/file-prefix autosomes_tajimas_d_/ {t=1} END {exit !t}' "$D/grenedalf_commands.sh" || fail "no separate Tajima's D run"
 awk 'BEGIN {RS=""} /tajimas_d_/ && !/--filter-sample-min-count 2 / {bad=1} END {exit bad}' "$D/grenedalf_commands.sh" \
     || fail "Tajima's D run not at min count 2"
+
+# Nothing named: every contig autosomal, one nuclear run, no X or mito run
+"${OPTIMISER[@]}" chromclass "${c[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --pool-sizes 400 \
+    --out "$D/unnamed" > /dev/null
+[[ $(awk -F'\t' 'NR>1 && $2!="A"' "$D/unnamed.chrom_classes.tsv" | wc -l) -eq 0 ]] || fail "unnamed contigs not all autosomal"
+mkdir -p "$D/unnamed_cmds"
+"${OPTIMISER[@]}" commands --prefix "$D/unnamed" --out-dir "$D/unnamed_cmds" --fai "$D/ref.fa.fai" \
+    --bam "${POOLS[@]/%/.bam}" --total-mask "$D/optimiser.total_mask.bed" --pool-size-arg 400 \
+    --min-count 2 --min-depth 10 --max-depth 282 --window 6000 --stride 3000 > /dev/null
+grep -q -- "--out-dir \$OUTDIR/nuclear " "$D/unnamed_cmds/grenedalf_commands.sh" || fail "no single nuclear run when nothing is named"
+! grep -q -- "--out-dir \$OUTDIR/\(X\|mito\) " "$D/unnamed_cmds/grenedalf_commands.sh" || fail "X or mito run without named contigs"
 
 echo "all checks passed ($D)"

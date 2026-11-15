@@ -53,9 +53,9 @@ GENMAP_ERRORS=2
 MAPPABILITY_BEDGRAPH=
 SOFTMASK=0
 BIN=1000
-CHROM_REGEX=.
-X_REGEX='chrX|_X_|^X$'
-MITO_REGEX='mitochondri|^chrM$|^MT$|mtDNA'
+SEX_CHROMS=           # sex chromosome (X or Z) contig name(s), comma separated; empty: none
+MITO_CHROMS=          # mitochondrial contig name(s), comma separated; empty: none
+CHROM_REGEX=.         # optional: only contigs matching this are analysed (default all)
 REGION=               # empty: whole genome (recommended); or a grenedalf --filter-region for a quick trial
 POOL_SIZES=           # per-pool sizes, POOL=N,POOL=N (overrides POOL_SIZE)
 MALE_FRACTION=        # known male fraction (0.5 for 50:50), or POOL=m,...; empty = estimate from X depth
@@ -83,6 +83,16 @@ source "$CONFIG"
 [[ -n "${POOL_SIZE:-}${POOL_SIZES:-}" ]] || { echo "set POOL_SIZE (or POOL_SIZES) in the config" >&2; exit 1; }
 [[ ${#BAMS[@]} -gt 0 ]] || { echo "set BAMS=(...) in the config" >&2; exit 1; }
 REGION=${REGION:-${PILOT_REGION:-}}   # PILOT_REGION: older configs
+
+# Older configs named contigs by regex (X_REGEX, MITO_REGEX): turn those into name lists
+if [[ -z "$SEX_CHROMS" && -n "${X_REGEX:-}" && -s "$FAI" ]]; then
+    SEX_CHROMS=$(cut -f1 "$FAI" | grep -E -- "$X_REGEX" | paste -sd, - || true)
+fi
+if [[ -z "$MITO_CHROMS" && -n "${MITO_REGEX:-}" && -s "$FAI" ]]; then
+    MITO_CHROMS=$(cut -f1 "$FAI" | grep -E -- "$MITO_REGEX" | paste -sd, - || true)
+fi
+SEX_CHROMS=${SEX_CHROMS// /}
+MITO_CHROMS=${MITO_CHROMS// /}
 
 # Pools are named as grenedalf names samples: the BAM file name without its extension
 NAMES=()
@@ -283,15 +293,23 @@ step_check() {
     fi
 
     echo "chromosome classes (from $FAI)"
-    local n_a n_x n_m
-    n_a=$(cut -f1 "$FAI" | grep -E -- "$CHROM_REGEX" | grep -v -E -- "$X_REGEX" | grep -c -v -E -- "$MITO_REGEX" || true)
-    n_x=$(cut -f1 "$FAI" | grep -E -- "$CHROM_REGEX" | grep -c -E -- "$X_REGEX" || true)
-    n_m=$(cut -f1 "$FAI" | grep -c -E -- "$MITO_REGEX" || true)
-    echo "  autosomes ($n_a): $(cut -f1 "$FAI" | grep -E -- "$CHROM_REGEX" | grep -v -E -- "$X_REGEX" | grep -v -E -- "$MITO_REGEX" | head -8 | tr '\n' ' ')"
-    echo "  X ($n_x): $(cut -f1 "$FAI" | grep -E -- "$CHROM_REGEX" | grep -E -- "$X_REGEX" | tr '\n' ' ')"
-    echo "  mitochondrion ($n_m): $(cut -f1 "$FAI" | grep -E -- "$MITO_REGEX" | tr '\n' ' ')"
-    echo "  not analysed: $(cut -f1 "$FAI" | grep -v -E -- "$CHROM_REGEX" | grep -c -v -E -- "$MITO_REGEX" || true) contig(s)"
-    [[ $n_a -gt 0 ]] || bad "no autosomes match CHROM_REGEX"
+    local c all_contigs analysed n_a
+    all_contigs=$(cut -f1 "$FAI")
+    for c in ${SEX_CHROMS//,/ } ${MITO_CHROMS//,/ }; do
+        grep -qx -- "$c" <<<"$all_contigs" || bad "contig $c (SEX_CHROMS / MITO_CHROMS) is not in $FAI"
+    done
+    analysed=$(grep -E -- "$CHROM_REGEX" <<<"$all_contigs" || true)
+    local autos
+    autos=$(grep -v -x -F -f <(tr ',' '\n' <<<"$SEX_CHROMS,$MITO_CHROMS" | grep .) <<<"$analysed" || true)
+    [[ -z "$SEX_CHROMS$MITO_CHROMS" ]] && autos=$analysed
+    n_a=$(grep -c . <<<"$autos" || true)
+    echo "  autosomal ($n_a): $(head -8 <<<"$autos" | tr '\n' ' ')$([[ $n_a -gt 8 ]] && echo "...")"
+    echo "  sex chromosome: ${SEX_CHROMS:-none named}"
+    echo "  mitochondrion: ${MITO_CHROMS:-none named}"
+    local n_out
+    n_out=$(grep -v -E -- "$CHROM_REGEX" <<<"$all_contigs" | grep -c . || true)
+    [[ $n_out -gt 0 ]] && echo "  not analysed (CHROM_REGEX): $n_out contig(s)"
+    [[ $n_a -gt 0 ]] || bad "no autosomal contigs left"
     echo "  pool sizes: ${POOL_SPEC}; male fraction: ${MALE_FRACTION:-estimated from X depth}; region: ${REGION:-whole genome}"
 
     if [[ $problems -gt 0 ]]; then echo "$problems problem(s): fix before running" >&2; exit 1; fi
@@ -325,7 +343,7 @@ step_mask() {
     local soft=()
     [[ "$SOFTMASK" == 1 ]] && soft=(--softmask)
     "${OPTIMISER[@]}" mask --fai "$FAI" --ref "$REF" ${soft[@]+"${soft[@]}"} --genmap "$bedgraph" --kmer "$KMER" \
-        --chrom-regex "$CHROM_REGEX" "${depth_args[@]}" --out "$P"
+        --chrom-regex "$CHROM_REGEX" --exclude-chroms "$MITO_CHROMS" "${depth_args[@]}" --out "$P"
 }
 
 step_profile() {
@@ -343,7 +361,7 @@ step_thresholds() {
     for n in "${NAMES[@]}"; do
         a+=(--dist "$n" "$OUT/profile/$n.mosdepth.region.dist.txt" --stats "$n" "$OUT/profile/$n.stats")
     done
-    "${OPTIMISER[@]}" thresholds "${a[@]}" --mask-summary "$P.mask_summary.tsv" --x-regex "$X_REGEX" \
+    "${OPTIMISER[@]}" thresholds "${a[@]}" --mask-summary "$P.mask_summary.tsv" --x-chroms "$SEX_CHROMS" \
         --min-fold "$MIN_FOLD" --max-fold "$MAX_FOLD" --abs-min-depth "$ABS_MIN_DEPTH" \
         --grid-min-folds "$GRID_MIN_FOLDS" --grid-max-folds "$GRID_MAX_FOLDS" \
         --base-qual "$BASEQ" --map-qual "$MAPQ" --pool-sizes "$POOL_SPEC" --out "$P"
@@ -354,7 +372,7 @@ step_chromclass() {
     local a=()
     for n in "${NAMES[@]}"; do a+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz"); done
     "${OPTIMISER[@]}" chromclass "${a[@]}" --fai "$FAI" --mask-bed "$MASK_BED" --chrom-regex "$CHROM_REGEX" \
-        --x-regex "$X_REGEX" --mito-regex "$MITO_REGEX" --pool-sizes "$POOL_SPEC" \
+        --x-chroms "$SEX_CHROMS" --mito-chroms "$MITO_CHROMS" --pool-sizes "$POOL_SPEC" \
         ${MALE_FRACTION:+--male-fraction "$MALE_FRACTION"} \
         --min-fold "$MIN_FOLD" --max-fold "$MAX_FOLD" --abs-min-depth "$ABS_MIN_DEPTH" --out "$P"
 }
@@ -474,7 +492,7 @@ MIN_SNPS=$MIN_SNPS
 EOF
     log "wrote $OUT/params.sh"
     cat "$OUT/params.sh"
-    "${OPTIMISER[@]}" commands --prefix "$P" --out-dir "$OUT" --fai "$FAI" --bam "${BAMS[@]}" --x-regex "$X_REGEX" \
+    "${OPTIMISER[@]}" commands --prefix "$P" --out-dir "$OUT" --fai "$FAI" --bam "${BAMS[@]}" --x-chroms "$SEX_CHROMS" \
         --total-mask "$TOTAL_MASK_BED" --sample-masks "$SAMPLE_MASK_LIST" --pool-size-arg "$POOL_SIZE_ARG" \
         --min-count "$mc" --min-depth "$MIN_DEPTH" --max-depth "$MAX_DEPTH" --window "$WINDOW" --stride "$STRIDE" \
         --min-snps "$MIN_SNPS" --map-qual "$MAPQ" --base-qual "$BASEQ" --fst-method "$FST_METHOD" --threads "$THREADS"

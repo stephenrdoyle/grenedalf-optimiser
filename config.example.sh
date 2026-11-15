@@ -13,9 +13,9 @@ THREADS=8
 POOL_SIZE=400                         # haploid genomes per pool (200 diploid L3)
 POOL_SIZES=                           # or per pool, if they differ: ARA_L3=400,BET_L3=380,...
 MALE_FRACTION=                        # known fraction of males (0.5 for 50:50; or POOL=m,...); empty = estimate from X depth
-CHROM_REGEX='hcontortus_chr[1-5X]_'   # analysed chromosomes; mitochondrion and the rest are masked
-X_REGEX='chrX'
-MITO_REGEX='mitochondrion'            # mitochondrial contig(s): analysed in their own run
+SEX_CHROMS=hcontortus_chrX_Celeg_TT_arrow_pilon   # sex chromosome contig(s), comma separated; empty = none
+MITO_CHROMS=mitochondrion                       # mitochondrial contig(s): own run; empty = none
+# every other contig is treated as autosomal
 REGION=                               # empty = whole genome (recommended); one chromosome for a quick trial
 
 # Read filters (kept fixed; reported, not tuned)

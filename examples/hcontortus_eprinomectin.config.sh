@@ -18,9 +18,9 @@ THREADS=8
 
 POOL_SIZE=400                         # 200 diploid L3 per pool
 MALE_FRACTION=                        # L3 sex ratio not known: estimate from X depth
-CHROM_REGEX='hcontortus_chr[1-5X]_'
-X_REGEX='chrX'
-MITO_REGEX='mitochondrion'
+SEX_CHROMS=hcontortus_chrX_Celeg_TT_arrow_pilon   # sex chromosome contig(s), comma separated; empty = none
+MITO_CHROMS=mitochondrion                       # mitochondrial contig(s): own run; empty = none
+# every other contig is treated as autosomal
 REGION=                               # whole genome
 
 KMER=150                              # read length: check (zcat a fastq | head -2 | tail -1 | wc -c)

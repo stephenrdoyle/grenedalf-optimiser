@@ -18,9 +18,8 @@ FAI=$D/ref.fa.fai
 BAMS=($D/poolA_L3.bam $D/poolB_L3.bam $D/poolC_L3.bam $D/poolD_L3.bam $D/poolE_L3.bam $D/poolF_L3.bam)
 OUT=$D/driver
 POOL_SIZE=400
-CHROM_REGEX=sim_
-X_REGEX=chrX
-MITO_REGEX=mito
+SEX_CHROMS=sim_chrX
+MITO_CHROMS=mito
 TARGET_SNPS=20
 LD_MAX_DIST=50000
 CONF
