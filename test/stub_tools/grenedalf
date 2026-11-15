@@ -6,6 +6,7 @@ cmd=$1; shift
 if [[ ${1:-} == --help ]]; then
     echo "--filter-mask-total-bed --filter-mask-sample-bed-list --filter-region --filter-sample-min-count"
     echo "--filter-sample-min-read-depth --filter-sample-max-read-depth --allow-file-overwriting"
+    echo "--pool-sizes  Pool sizes: a single number, or a file with sample name and size"
     exit 0
 fi
 while [[ $# -gt 0 ]]; do [[ $1 == --out-dir ]] && out=$2; shift; done

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
-# Stand-in for samtools stats
+# Stand-in for samtools: stats prints the simulated stats; view -H prints @SQ lines from the .fai
+if [[ $1 == view ]]; then
+    awk -F'\t' '{print "@SQ\tSN:" $1 "\tLN:" $2}' "$SIM_DIR/ref.fa.fai"
+    exit 0
+fi
 bam=${!#}
 cat "$SIM_DIR/$(basename "${bam%.*}").stats"

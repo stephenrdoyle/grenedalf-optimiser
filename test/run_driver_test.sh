@@ -24,6 +24,8 @@ MITO_REGEX=mito
 TARGET_SNPS=20
 LD_MAX_DIST=50000
 CONF
+for p in poolA_L3 poolB_L3 poolC_L3 poolD_L3 poolE_L3 poolF_L3; do touch "$D/$p.bam.bai"; echo bam > "$D/$p.bam"; done
+"$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" check
 "$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" all
 for f in optimiser.mask.bed optimiser.depth_thresholds.tsv optimiser.total_mask.bed optimiser.ld.params optimiser.windows.params \
          optimiser.assess_runs.tsv optimiser.chrom_classes.tsv params.sh grenedalf_commands.sh optimiser_report.html grid/per_sample_masks/mask.sample_masks.tsv; do

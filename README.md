@@ -57,7 +57,17 @@ cp config.example.sh my_config.sh    # edit paths, pools, pool sizes
 bin/grenedalf_optimiser.sh my_config.sh all
 ```
 
-Or run one step at a time (`mask profile thresholds chromclass quantize depthmask pilot grid params report`).
+Run `check` first: it takes a minute or two and catches most setup problems before a
+long job is submitted. It checks tools and python packages, grenedalf's options (and prints
+its `--pool-sizes` help so the per-pool file format can be confirmed), BAMs and their
+indexes, and BAM contig names against the reference. It also lists which contigs the
+regexes pick up as autosomes, X and mitochondrion.
+
+```bash
+bin/grenedalf_optimiser.sh my_config.sh check
+```
+
+Or run one step at a time (`check mask profile thresholds chromclass quantize depthmask pilot grid params report`).
 Each step reads what the previous ones wrote in `OUT/`. On the farm, for example:
 
 ```bash
@@ -83,6 +93,16 @@ and is only chosen if the mask turns out not to matter.
 The grid does **not** change the accessibility mask, the window width (from SNP
 density and the linkage scale), the X / mitochondrion decision, or the read filters
 (MAPQ, base quality).
+
+On the Sanger farm, `examples/submit_lsf.sh` submits the whole run as one job on the
+long queue. `examples/hcontortus_eprinomectin.config.sh` is a filled-in config for the
+eprinomectin pools (set `BAM_DIR`):
+
+```bash
+git clone https://github.com/stephenrdoyle/grenedalf-optimiser.git && cd grenedalf-optimiser
+bin/grenedalf_optimiser.sh examples/hcontortus_eprinomectin.config.sh check
+examples/submit_lsf.sh examples/hcontortus_eprinomectin.config.sh
+```
 
 The memory goes on GenMap indexing and on the mask step, which holds one chromosome as
 per-base arrays and the GenMap bedGraph.

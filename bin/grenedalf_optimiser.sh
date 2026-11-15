@@ -5,6 +5,7 @@
 # before any biological signal is looked at. See README.md.
 #
 # Steps (run in order, or "all"):
+#   check      preflight: tools, python packages, grenedalf options, BAMs, indexes, contig names
 #   mask       GenMap mappability + mosdepth depth bins -> accessibility mask
 #   profile    per-pool depth distribution in the accessible genome, samtools stats
 #   thresholds per-pool depth bounds, minimum allele count, quantize cut points
@@ -131,6 +132,72 @@ run_grenedalf() {
     mkdir -p "$dir"
     "$GRENEDALF" diversity "${args[@]}" > "$dir/diversity.log" 2>&1
     "$GRENEDALF" fst "${args[@]}" --method "$FST_METHOD" > "$dir/fst.log" 2>&1
+}
+
+step_check() {
+    local problems=0
+    bad() { echo "  PROBLEM: $*"; problems=$((problems + 1)); }
+    ok() { echo "  ok: $*"; }
+
+    echo "tools"
+    for t in "$MOSDEPTH" "$SAMTOOLS" "$GRENEDALF" python3; do
+        if command -v "$t" > /dev/null; then ok "$t ($(command -v "$t"))"; else bad "$t not on PATH"; fi
+    done
+    if [[ -z "$MAPPABILITY_BEDGRAPH" ]]; then
+        if command -v "$GENMAP" > /dev/null; then ok "$GENMAP"; else bad "$GENMAP not on PATH (or set MAPPABILITY_BEDGRAPH)"; fi
+    elif [[ -s "$MAPPABILITY_BEDGRAPH" ]]; then ok "mappability bedGraph $MAPPABILITY_BEDGRAPH"
+    else bad "MAPPABILITY_BEDGRAPH $MAPPABILITY_BEDGRAPH not found"; fi
+    if python3 -c "import numpy, pandas" 2> /dev/null; then
+        ok "python3 numpy $(python3 -c 'import numpy; print(numpy.__version__)'), pandas $(python3 -c 'import pandas; print(pandas.__version__)')"
+    else
+        bad "python3 cannot import numpy and pandas"
+    fi
+    if command -v "$GRENEDALF" > /dev/null; then
+        local help opt
+        help=$("$GRENEDALF" diversity --help 2>&1)
+        for opt in --filter-mask-total-bed --filter-mask-sample-bed-list --filter-sample-min-count \
+                   --filter-sample-min-read-depth --filter-sample-max-read-depth --allow-file-overwriting \
+                   --pool-sizes ${REGION:+--filter-region}; do
+            grep -q -- "$opt" <<<"$help" || bad "grenedalf diversity has no $opt"
+        done
+        ok "grenedalf options present"
+        grep -A3 -- "--pool-sizes" <<<"$help" | sed 's/^/      /'
+    fi
+
+    echo "inputs"
+    [[ -s "$REF" ]] && ok "reference $REF" || bad "reference $REF not found"
+    [[ -s "$FAI" ]] && ok "index $FAI ($(wc -l < "$FAI") contigs)" || bad "fai $FAI not found"
+    local i bam dup
+    dup=$(printf '%s\n' "${NAMES[@]}" | sort | uniq -d)
+    [[ -z "$dup" ]] || bad "pool names (BAM file names) not unique: $dup"
+    for i in "${!BAMS[@]}"; do
+        bam=${BAMS[$i]}
+        if [[ ! -s "$bam" ]]; then bad "BAM $bam not found"; continue; fi
+        if [[ -e "$bam.bai" || -e "${bam%.bam}.bai" || -e "$bam.csi" ]]; then ok "${NAMES[$i]}: $bam (indexed)"
+        else bad "$bam has no .bai/.csi index"; fi
+    done
+    if [[ -s "${BAMS[0]}" && -s "$FAI" ]] && command -v "$SAMTOOLS" > /dev/null; then
+        local missing
+        missing=$(comm -13 <("$SAMTOOLS" view -H "${BAMS[0]}" | awk -F'\t' '$1=="@SQ" {sub("SN:","",$2); print $2}' | sort) \
+                           <(cut -f1 "$FAI" | sort) | head -5)
+        [[ -z "$missing" ]] && ok "every reference contig is in the BAM header" \
+            || bad "reference contigs missing from ${BAMS[0]} header (wrong reference?): $missing"
+    fi
+
+    echo "chromosome classes (from $FAI)"
+    local n_a n_x n_m
+    n_a=$(cut -f1 "$FAI" | grep -E -- "$CHROM_REGEX" | grep -v -E -- "$X_REGEX" | grep -c -v -E -- "$MITO_REGEX" || true)
+    n_x=$(cut -f1 "$FAI" | grep -E -- "$CHROM_REGEX" | grep -c -E -- "$X_REGEX" || true)
+    n_m=$(cut -f1 "$FAI" | grep -c -E -- "$MITO_REGEX" || true)
+    echo "  autosomes ($n_a): $(cut -f1 "$FAI" | grep -E -- "$CHROM_REGEX" | grep -v -E -- "$X_REGEX" | grep -v -E -- "$MITO_REGEX" | head -8 | tr '\n' ' ')"
+    echo "  X ($n_x): $(cut -f1 "$FAI" | grep -E -- "$CHROM_REGEX" | grep -E -- "$X_REGEX" | tr '\n' ' ')"
+    echo "  mitochondrion ($n_m): $(cut -f1 "$FAI" | grep -E -- "$MITO_REGEX" | tr '\n' ' ')"
+    echo "  not analysed: $(cut -f1 "$FAI" | grep -v -E -- "$CHROM_REGEX" | grep -c -v -E -- "$MITO_REGEX" || true) contig(s)"
+    [[ $n_a -gt 0 ]] || bad "no autosomes match CHROM_REGEX"
+    echo "  pool sizes: ${POOL_SPEC}; male fraction: ${MALE_FRACTION:-estimated from X depth}; region: ${REGION:-whole genome}"
+
+    if [[ $problems -gt 0 ]]; then echo "$problems problem(s): fix before running" >&2; exit 1; fi
+    echo "all checks passed"
 }
 
 step_mask() {
@@ -321,7 +388,7 @@ step_report() {
 }
 
 case "$STEP" in
-    mask|profile|thresholds|chromclass|quantize|depthmask|pilot|grid|params|report) "step_$STEP" ;;
+    check|mask|profile|thresholds|chromclass|quantize|depthmask|pilot|grid|params|report) "step_$STEP" ;;
     all) for s in mask profile thresholds chromclass quantize depthmask pilot grid params report; do log "== $s"; "step_$s"; done ;;
     *) echo "unknown step: $STEP" >&2; exit 1 ;;
 esac
