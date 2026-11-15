@@ -27,7 +27,7 @@ for p in "${POOLS[@]}"; do a+=(--dist "$p" "$D/$p.mosdepth.region.dist.txt" --st
 "${OPTIMISER[@]}" thresholds "${a[@]}" --x-chroms sim_chrX --mask-summary "$D/optimiser.mask_summary.tsv" --pool-sizes 400 --out "$D/optimiser"
 
 c=()
-for p in "${POOLS[@]}"; do c+=(--depth "$p" "$D/$p.mq30.regions.bed.gz"); done
+for p in "${POOLS[@]}"; do c+=(--depth "$p" "$D/$p.mq30.regions.bed.gz" --depth-mq0 "$p" "$D/$p.mq0.regions.bed.gz"); done
 "${OPTIMISER[@]}" chromclass "${c[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --x-chroms sim_chrX \
     --mito-chroms mito --pool-sizes 400 --out "$D/optimiser"
 
@@ -77,12 +77,13 @@ source "$D/optimiser.ld.params"
 source "$D/optimiser.windows.params"
 [[ $WINDOW -ge $LD_D10 ]] || fail "window $WINDOW narrower than the linkage scale $LD_D10"
 
-# X simulated at 0.6-0.8x autosome depth (mixed-sex pools): separate run, X pool size = 400 x ratio
+# X simulated at 0.6-0.8x autosome depth (mixed-sex pools): separate run, X pool size = 400 x ratio.
+# +-15%: the simulated X is only 150 kb (150 bins, ~30 independent depth blocks); a real X has tens of thousands
 # (300 for 50:50); mito always separate
 source "$D/optimiser.chromclass.params"
 [[ $X_SEPARATE == 1 && $MITO_SEPARATE == 1 ]] || fail "X / mito not flagged for separate runs"
 awk -F'\t' 'BEGIN {r["poolA_L3"]=.75; r["poolB_L3"]=.75; r["poolC_L3"]=.7; r["poolD_L3"]=.8; r["poolE_L3"]=.75; r["poolF_L3"]=.6}
-    {e = 400 * r[$1]; if ($2 < 0.9 * e || $2 > 1.1 * e) bad = 1} END {exit bad}' "$D/optimiser.x_pool_sizes.tsv" \
+    {e = 400 * r[$1]; if ($2 < 0.85 * e || $2 > 1.15 * e) bad = 1} END {exit bad}' "$D/optimiser.x_pool_sizes.tsv" \
     || fail "X pool sizes not 400 x simulated X ratio: $(tr '\n' ' ' < "$D/optimiser.x_pool_sizes.tsv")"
 # Known 50:50 design: X pool size 300 everywhere; poolF (simulated 0.6, i.e. 80% males) flagged as inconsistent
 "${OPTIMISER[@]}" chromclass "${c[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --x-chroms sim_chrX \
@@ -101,6 +102,26 @@ grep -q -- "--no-tajima-d" "$D/grenedalf_commands.sh" || fail "diversity at min 
 awk '/file-prefix autosomes_tajimas_d_/ {t=1} END {exit !t}' "$D/grenedalf_commands.sh" || fail "no separate Tajima's D run"
 awk 'BEGIN {RS=""} /tajimas_d_/ && !/--filter-sample-min-count 2 / {bad=1} END {exit bad}' "$D/grenedalf_commands.sh" \
     || fail "Tajima's D run not at min count 2"
+
+# Impossible X ratio (X depth above autosomes, as on reference-divergent real data): flagged,
+# and 0.5 assumed rather than "no males"
+mkdir -p "$D/hix"
+for p in "${POOLS[@]}"; do
+    gzip -dc "$D/$p.mq30.regions.bed.gz" | awk -F'\t' -v OFS='\t' '$1=="sim_chrX" {$4 = $4 * 1.6} 1' | gzip > "$D/hix/$p.mq30.regions.bed.gz"
+done
+h=()
+for p in "${POOLS[@]}"; do h+=(--depth "$p" "$D/hix/$p.mq30.regions.bed.gz"); done
+"${OPTIMISER[@]}" chromclass "${h[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --x-chroms sim_chrX \
+    --mito-chroms mito --pool-sizes 400 --out "$D/hix/c" > /dev/null 2> "$D/hix/err"
+source "$D/hix/c.chromclass.params"
+[[ $X_RATIO_UNRELIABLE == 1 && $X_SEPARATE == 1 ]] || fail "impossible X ratio not flagged"
+grep -q WARNING "$D/hix/err" || fail "no warning for an impossible X ratio"
+awk -F'\t' '$2 != 300 {bad=1} END {exit bad}' "$D/hix/c.x_pool_sizes.tsv" || fail "impossible X ratio: 0.5 not assumed"
+# Mito: per-pool bounds and per-pool masks
+[[ $(wc -l < "$D/optimiser.mito_sample_masks.tsv") -eq 6 ]] || fail "no per-pool mito masks"
+awk -F'\t' 'NR>1 {l[$6]=1} END {exit length(l) < 3}' "$D/optimiser.mito.tsv" || fail "mito bounds not per pool"
+grep -q -- "--filter-mask-samples-bed-list $D/optimiser.mito_sample_masks.tsv" "$D/grenedalf_commands.sh" \
+    || fail "mito run without per-pool masks"
 
 # Nothing named: every contig autosomal, one nuclear run, no X or mito run
 "${OPTIMISER[@]}" chromclass "${c[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --pool-sizes 400 \

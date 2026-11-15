@@ -669,8 +669,27 @@ def cmd_windows(args):
 # ---------------------------------------------------------------------------
 # chromclass
 
-def block_bootstrap_ratio(x, a, n_boot, block, rng):
-    """95% interval of median(x) / median(a), resampling blocks of adjacent bins."""
+def density_mode(x, grid=1024):
+    """Peak of a distribution: the maximum of a Gaussian kernel density estimate (robust
+    Silverman bandwidth). Unlike the median, unaffected by a heavy tail on one side."""
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 5:
+        return float(np.median(x)) if x.size else np.nan
+    lo, hi = np.percentile(x, [0.5, 99.5])
+    q1, q3 = np.percentile(x, [25, 75])
+    scale = min(np.std(x), (q3 - q1) / 1.349) or np.std(x) or 1.0
+    bw = 0.9 * scale * x.size ** -0.2
+    edges = np.linspace(lo, hi, grid + 1)
+    counts, _ = np.histogram(x, bins=edges)
+    step = edges[1] - edges[0]
+    k = np.arange(-int(4 * bw / step) - 1, int(4 * bw / step) + 2) * step
+    dens = np.convolve(counts, np.exp(-0.5 * (k / bw) ** 2), mode="same")
+    return float((edges[:-1] + step / 2)[int(np.argmax(dens))])
+
+
+def block_bootstrap_ratio(x, a, n_boot, block, rng, stat=np.median):
+    """95% interval of stat(x) / stat(a), resampling blocks of adjacent bins."""
     def blocks(v):
         k = max(len(v) // block, 1)
         return [v[i * block:(i + 1) * block] for i in range(k)] if len(v) >= block else [v]
@@ -679,7 +698,7 @@ def block_bootstrap_ratio(x, a, n_boot, block, rng):
     for i in range(n_boot):
         sx = np.concatenate([bx[j] for j in rng.integers(0, len(bx), len(bx))])
         sa = np.concatenate([ba[j] for j in rng.integers(0, len(ba), len(ba))])
-        out[i] = np.median(sx) / np.median(sa)
+        out[i] = stat(sx) / stat(sa)
     return np.percentile(out, [2.5, 97.5])
 
 
@@ -689,18 +708,26 @@ def cmd_chromclass(args):
     X: in a pool with males (hemizygous), X depth is below autosome depth, and the X is
     sampled from fewer copies, so grenedalf needs a smaller X pool size: with a fraction m
     of males, X depth / autosome depth = 1 - m/2, and the X pool size is pool_size * (1 - m/2).
-    A 50:50 pool gives 0.75. m is estimated from the depth ratio unless given with
-    --male-fraction (known from the design), in which case the known value sets the X pool
-    size and the estimate is reported as a check (consistent if its interval contains 1 - m/2).
-    If any pool's ratio differs from 1 (95% interval excludes it, by more than
-    --min-difference), the X is run separately with its own pool sizes.
+    A 50:50 pool gives 0.75.
+
+    The ratio is taken between the peaks (kernel density mode) of the two depth distributions,
+    over well-mapped bins only (most reads pass the MAPQ cut-off). Medians are pulled down
+    wherever reads fail to map, e.g. haplotypes divergent from the reference, which affects
+    autosomes and X differently. A ratio outside 0.5-1 (beyond --min-difference) is
+    impossible for a sex ratio and is reported as unreliable: the male fraction then comes
+    from --male-fraction, or 0.5 is assumed. With --male-fraction given, the known value is
+    always used and the estimate is reported as a check.
+
     Mitochondrion: haploid, many copies per cell, one lineage per individual: always run
-    separately, with its own depth bounds and a pool size of the number of individuals."""
+    separately, with depth bounds per pool (copy number differs between pools) applied as
+    per-pool masks, and a pool size of the number of individuals."""
     x_chroms, mito_chroms, keep = name_list(args.x_chroms), name_list(args.mito_chroms), re.compile(args.chrom_regex)
     fai = read_fai(args.fai)
     mask = merge_intervals(read_bed(args.mask_bed)) if args.mask_bed else None
-    sizes = parse_pool_sizes(args.pool_sizes, [n for n, _ in args.depth])
-    known_m = parse_pool_sizes(args.male_fraction, [n for n, _ in args.depth])
+    names = [n for n, _ in args.depth]
+    sizes = parse_pool_sizes(args.pool_sizes, names)
+    known_m = parse_pool_sizes(args.male_fraction, names)
+    mq0 = dict(args.depth_mq0 or [])
     rng = np.random.default_rng(args.seed)
 
     def chrom_class(c):
@@ -710,9 +737,12 @@ def cmd_chromclass(args):
             return None
         return "X" if c in x_chroms else "A"
 
-    rows, mito_bounds = [], {}
+    rows, mito_rows, mito_masks = [], [], {}
     for name, path in args.depth:
         b = read_mosdepth_bins(path, "depth")
+        if name in mq0:
+            b0 = read_mosdepth_bins(mq0[name], "depth0")
+            b = b.merge(b0, on=["chrom", "start", "end"], how="left")
         b["class"] = b["chrom"].map(chrom_class)
         b = b[b["class"].notna()].copy()
         if mask is not None:
@@ -726,67 +756,119 @@ def cmd_chromclass(args):
                 cs = coverage_prefix(m, int(g["end"].max()))
                 frac[idx] = (cs[g["end"].to_numpy()] - cs[g["start"].to_numpy()]) / (g["end"] - g["start"]).to_numpy()
             b = b[(frac < 0.5) | (b["class"] == "M")]
-        a = b.loc[b["class"] == "A", "depth"].to_numpy()
+        # Well-mapped bins: most reads pass the MAPQ cut-off (needs the MAPQ 0 bins)
+        if "depth0" in b:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                mapped = (b["depth"] / b["depth0"]).to_numpy()
+            well = (mapped >= args.min_mapped_ratio) & (b["depth"].to_numpy() > 0)
+        else:
+            well = b["depth"].to_numpy() > 0
+        a_all = b.loc[b["class"] == "A", "depth"].to_numpy()
+        a = b.loc[(b["class"] == "A") & well, "depth"].to_numpy()
         if a.size == 0:
-            sys.exit(f"{name}: no autosomal bins")
-        med_a = float(np.median(a))
+            sys.exit(f"{name}: no well-mapped autosomal bins")
+        mode_a = density_mode(a)
         n = sizes.get(name, np.nan)
-        rows.append({"pool": name, "class": "A", "bins": a.size, "median_depth": med_a, "ratio_to_A": 1.0,
-                     "ci_low": 1.0, "ci_high": 1.0, "differs": False, "pool_size": n})
-        for cls in ("X", "M"):
-            x = b.loc[b["class"] == cls, "depth"].to_numpy()
-            if x.size == 0:
-                continue
-            ratio = float(np.median(x)) / med_a
-            lo, hi = block_bootstrap_ratio(x, a, args.bootstrap, args.block, rng)
-            differs = bool((hi < 1 or lo > 1) and abs(ratio - 1) > args.min_difference)
-            row = {"pool": name, "class": cls, "bins": x.size, "median_depth": float(np.median(x)),
-                   "ratio_to_A": round(ratio, 4), "ci_low": round(float(lo), 4), "ci_high": round(float(hi), 4),
-                   "differs": differs}
-            if cls == "X":
-                m_est = float(np.clip(2 * (1 - ratio), 0, 1))
-                row["male_fraction_est"] = round(m_est, 3)
-                row["male_fraction_ci"] = f"{np.clip(2 * (1 - hi), 0, 1):.2f}-{np.clip(2 * (1 - lo), 0, 1):.2f}"
-                if name in known_m:
-                    m = known_m[name]
-                    row["male_fraction_known"] = m
-                    row["expected_ratio"] = round(1 - m / 2, 4)
-                    row["matches_known"] = bool(lo <= 1 - m / 2 <= hi)
-                else:
-                    m = m_est
-                row["male_fraction_used"] = round(m, 3)
-                row["pool_size"] = round(n * (1 - m / 2)) if np.isfinite(n) else np.nan
-            else:
-                row["pool_size"] = round(n / 2) if np.isfinite(n) else np.nan
-                mito_bounds[name] = depth_bounds(float(np.median(x)), args.min_fold, args.max_fold, args.abs_min_depth)
+        rows.append({"pool": name, "class": "A", "bins": a.size, "median_depth": round(float(np.median(a_all)), 2),
+                     "mode_depth": round(mode_a, 2), "ratio_to_A": 1.0, "ratio_median": 1.0, "ci_low": 1.0,
+                     "ci_high": 1.0, "differs": False, "pool_size": n})
+
+        x_all = b.loc[b["class"] == "X", "depth"].to_numpy()
+        x = b.loc[(b["class"] == "X") & well, "depth"].to_numpy()
+        if x.size:
+            ratio = density_mode(x) / mode_a
+            lo, hi = block_bootstrap_ratio(x, a, args.bootstrap, args.block, rng, stat=density_mode)
+            plausible = (0.5 - args.min_difference) <= ratio <= (1 + args.min_difference)
+            m_est = float(np.clip(2 * (1 - ratio), 0, 1))
+            row = {"pool": name, "class": "X", "bins": x.size, "median_depth": round(float(np.median(x_all)), 2),
+                   "mode_depth": round(density_mode(x), 2), "ratio_to_A": round(ratio, 4),
+                   "ratio_median": round(float(np.median(x_all) / np.median(a_all)), 4),
+                   "ci_low": round(float(lo), 4), "ci_high": round(float(hi), 4),
+                   "differs": bool((hi < 1 or lo > 1) and abs(ratio - 1) > args.min_difference),
+                   "plausible": plausible,
+                   "male_fraction_est": round(m_est, 3) if plausible else np.nan,
+                   "male_fraction_ci": f"{np.clip(2 * (1 - hi), 0, 1):.2f}-{np.clip(2 * (1 - lo), 0, 1):.2f}"
+                   if plausible else "NA"}
+            if name in known_m:
+                m = known_m[name]
+                row["male_fraction_known"] = m
+                row["expected_ratio"] = round(1 - m / 2, 4)
+                row["matches_known"] = bool(lo <= 1 - m / 2 <= hi) if plausible else np.nan
+            row["_n"] = n
             rows.append(row)
+
+        mt = b[b["class"] == "M"]
+        if len(mt):
+            med = float(np.median(mt["depth"]))
+            lower, upper = depth_bounds(med, args.min_fold, args.max_fold, args.abs_min_depth)
+            lo, hi = block_bootstrap_ratio(mt["depth"].to_numpy(), a, args.bootstrap, args.block, rng)
+            out = mt[(mt["depth"] < lower) | (mt["depth"] > upper)]
+            mito_masks[name] = out[["chrom", "start", "end"]]
+            mito_rows.append({"pool": name, "median_depth": round(med, 1), "ratio_to_A": round(med / mode_a, 2),
+                              "ci_low": round(float(lo), 2), "ci_high": round(float(hi), 2),
+                              "lower": lower, "upper": upper,
+                              "masked_bp": int((out["end"] - out["start"]).sum()),
+                              "pool_size": round(n / 2) if np.isfinite(n) else np.nan})
+
+    # Male fraction used for the X pool size. Whatever pushes one pool's X depth outside what a
+    # sex ratio allows (reference divergence, GC, mapping) affects every pool, so if any
+    # estimate is implausible, none is used: known values where given, else 0.5 for all.
+    xrows = [r for r in rows if r["class"] == "X"]
+    all_plausible = all(r["plausible"] for r in xrows)
+    for r in xrows:
+        n = r.pop("_n")
+        if r["pool"] in known_m:
+            m, source = known_m[r["pool"]], "known"
+        elif all_plausible:
+            m, source = r["male_fraction_est"], "estimated"
+        else:
+            m, source = 0.5, "assumed (X depth estimates implausible)"
+        r["male_fraction_used"] = round(m, 3)
+        r["male_fraction_source"] = source
+        r["pool_size"] = round(n * (1 - m / 2)) if np.isfinite(n) else np.nan
 
     t = pd.DataFrame(rows)
     t.to_csv(f"{args.out}.chrom_classes.tsv", sep="\t", index=False)
     x = t[t["class"] == "X"]
-    m = t[t["class"] == "M"]
-    params = {"X_SEPARATE": int(bool(x["differs"].any())) if len(x) else 0,
-              "MITO_CHROMS": ",".join(c for c in fai["chrom"] if c in mito_chroms)}
-    if len(x) and x["pool_size"].notna().all():
-        with open(f"{args.out}.x_pool_sizes.tsv", "w") as fh:
-            for r in x.itertuples():
-                fh.write(f"{r.pool}\t{int(r.pool_size)}\n")
-        params["X_POOL_SIZES"] = f"{args.out}.x_pool_sizes.tsv"
-    if len(m):
-        params.update({"MITO_SEPARATE": 1, "MITO_MIN_DEPTH": min(v[0] for v in mito_bounds.values()),
-                       "MITO_MAX_DEPTH": max(v[1] for v in mito_bounds.values())})
-        if m["pool_size"].notna().all():
+    params = {"MITO_CHROMS": ",".join(c for c in fai["chrom"] if c in mito_chroms)}
+    if len(x):
+        # X gets its own run whenever its pool size differs from the autosomal one, or its depth does
+        own_size = (x["male_fraction_used"] > 0.025).any()
+        params["X_SEPARATE"] = int(bool(own_size or x["differs"].any()))
+        params["X_RATIO_UNRELIABLE"] = int(not x["plausible"].all())
+        if x["pool_size"].notna().all():
+            with open(f"{args.out}.x_pool_sizes.tsv", "w") as fh:
+                for r in x.itertuples():
+                    fh.write(f"{r.pool}\t{int(r.pool_size)}\n")
+            params["X_POOL_SIZES"] = f"{args.out}.x_pool_sizes.tsv"
+    else:
+        params["X_SEPARATE"] = 0
+    if mito_rows:
+        mt = pd.DataFrame(mito_rows)
+        mt.to_csv(f"{args.out}.mito.tsv", sep="\t", index=False)
+        with open(f"{args.out}.mito_sample_masks.tsv", "w") as fh:
+            for name, m in mito_masks.items():
+                path = f"{args.out}.mito_mask.{name}.bed"
+                write_bed(m, path)
+                fh.write(f"{name}\t{path}\n")
+        params.update({"MITO_SEPARATE": 1, "MITO_SAMPLE_MASKS": f"{args.out}.mito_sample_masks.tsv",
+                       # grenedalf's global bounds only as a backstop: the per-pool masks apply each pool's range
+                       "MITO_MIN_DEPTH": int(mt["lower"].min()), "MITO_MAX_DEPTH": int(mt["upper"].max())})
+        if mt["pool_size"].notna().all():
             with open(f"{args.out}.mito_pool_sizes.tsv", "w") as fh:
-                for r in m.itertuples():
+                for r in mt.itertuples():
                     fh.write(f"{r.pool}\t{int(r.pool_size)}\n")
             params["MITO_POOL_SIZES"] = f"{args.out}.mito_pool_sizes.tsv"
     else:
         params["MITO_SEPARATE"] = 0
     write_params(f"{args.out}.chromclass.params", params)
     print(t.to_string(index=False))
-    if len(x):
-        print("\nX differs from autosomes in at least one pool: run it separately with its own pool sizes"
-              if params["X_SEPARATE"] else "\nX behaves like the autosomes in every pool: analyse together")
+    if mito_rows:
+        print("\n" + pd.DataFrame(mito_rows).to_string(index=False))
+    if len(x) and params["X_RATIO_UNRELIABLE"]:
+        print("\nWARNING: X / autosome depth is outside the range a sex ratio can give (0.5-1) in at least one "
+              "pool: depth does not reflect copy number here (e.g. reference divergence). The male fraction "
+              "comes from --male-fraction, or 0.5 is assumed; set it from the study design.", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -827,7 +909,8 @@ def cmd_commands(args):
         write_bed(whole([c for c in fai["chrom"] if c not in mito]), m_mask)
         runs.append(("mito", "mitochondrion: haploid, pool size = individuals, its own depth bounds "
                      "(whole genome as one window)", m_mask, cc.get("MITO_POOL_SIZES", args.pool_size_arg),
-                     cc.get("MITO_MIN_DEPTH", args.min_depth), cc.get("MITO_MAX_DEPTH", args.max_depth), ""))
+                     cc.get("MITO_MIN_DEPTH", args.min_depth), cc.get("MITO_MAX_DEPTH", args.max_depth),
+                     cc.get("MITO_SAMPLE_MASKS", "")))
 
     L = ["#!/usr/bin/env bash",
          f"# grenedalf commands recommended by grenedalf-optimiser ({pd.Timestamp.now():%Y-%m-%d}).",
@@ -1256,6 +1339,10 @@ def main():
     p = sub.add_parser("chromclass", help="test whether X and mitochondrion depth differ from autosomes")
     p.add_argument("--depth", nargs=2, action="append", required=True, metavar=("POOL", "MQX_BINS"),
                    help="mosdepth bins at the MAPQ cut-off; repeat per pool")
+    p.add_argument("--depth-mq0", nargs=2, action="append", metavar=("POOL", "MQ0_BINS"),
+                   help="mosdepth bins without the MAPQ cut-off, to find well-mapped bins; repeat per pool")
+    p.add_argument("--min-mapped-ratio", type=float, default=0.9,
+                   help="well-mapped bin: depth at the MAPQ cut-off / depth at MAPQ 0 at least this [0.9]")
     p.add_argument("--fai", required=True)
     p.add_argument("--mask-bed", help="accessibility mask (bins mostly masked are ignored)")
     p.add_argument("--chrom-regex", default=".", help="optionally, only contigs matching this are analysed [all]")

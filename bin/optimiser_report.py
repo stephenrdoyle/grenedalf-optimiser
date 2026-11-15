@@ -282,8 +282,12 @@ def heat_table(df, value_cols, fmt, vmax=None, pick=None, pick_row=None, caption
 
 
 def plain_table(df, max_rows=None):
-    d = df if max_rows is None else df.head(max_rows)
-    return heat_table(d, [], str)
+    d = (df if max_rows is None else df.head(max_rows)).copy()
+    for c in d.columns:
+        v = pd.to_numeric(d[c], errors="coerce")
+        if d[c].dtype.kind == "f" and v.notna().any() and (v.dropna() % 1 == 0).all():
+            d[c] = v.map(lambda x: "–" if pd.isna(x) else f"{int(x):,}" if abs(x) >= 10000 else str(int(x)))
+    return heat_table(d.astype(object).where(d.notna(), "–"), [], str)
 
 
 def read_tsv(path, **kw):
@@ -367,11 +371,20 @@ def section_summary(P, out_dir):
         glob = (f" grenedalf's own <code>--filter-sample-min-read-depth</code> / <code>--filter-sample-max-read-depth</code> "
                 f"are set to {mp['MIN_DEPTH']} / {mp['MAX_DEPTH']}, wide enough not to undo these."
                 if "MIN_DEPTH" in mp else "")
+        cost = ""
+        if dm is not None and (dm["pool"] == "shared").any():
+            per = dm[dm["pool"] != "shared"]["out_of_range_frac"].astype(float)
+            sh = float(dm.loc[dm["pool"] == "shared", "out_of_range_frac"].iloc[0])
+            cost = (f" Each pool's own bounds remove {100 * per.min():.0f}–{100 * per.max():.0f}% of the accessible "
+                    f"genome; the shared mask removes <strong>{100 * sh:.0f}%</strong> ({sh / per.max():.1f}× the "
+                    "largest single pool), because the pools are out of range in different places. Most of that "
+                    "is usually low depth; see <em>Where the mask falls</em> for whether it is long blocks in "
+                    "single pools (divergent haplotypes, deletions) or scattered.")
         body += ("<h3>Depth bounds per pool</h3>"
                  "<p>grenedalf has a single depth filter for all pools, so each pool's own range is applied as a "
                  "mask: a site outside any pool's range is masked in every pool, so all pools are called at the same "
                  f"sites.{glob} n_eff is the number of chromosomes effectively sampled at that depth from a pool of "
-                 "that size; depth well beyond the pool size adds little.</p>" + plain_table(pd.DataFrame(rows)))
+                 f"that size; depth well beyond the pool size adds little.{cost}</p>" + plain_table(pd.DataFrame(rows)))
 
     cmd_path = os.path.join(out_dir, "grenedalf_commands.sh") if out_dir else ""
     if cmd_path and os.path.exists(cmd_path):
@@ -467,6 +480,30 @@ def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
     if final is not None:
         rows.append(("final", "final mask (+ depth bounds)"))
 
+    # Per pool: share of each bin (1 kb mosdepth bins) outside that pool's depth bounds
+    pool_bins = {}
+    thr = read_tsv(f"{P}.depth_thresholds.tsv")
+    classes = read_tsv(f"{P}.chrom_class.tsv", dtype={"chrom": str})
+    depth_dir = os.path.join(out_dir, "depth") if out_dir else ""
+    if thr is not None and classes is not None and os.path.isdir(depth_dir):
+        cls = dict(zip(classes["chrom"], classes["class"]))
+        for pool, g in thr.groupby("pool", sort=False):
+            files = [f for f in os.listdir(depth_dir) if f.startswith(pool + ".mq") and f.endswith(".regions.bed.gz")
+                     and not f.startswith(pool + ".mq0.")]
+            if not files:
+                continue
+            b = pd.read_csv(os.path.join(depth_dir, files[0]), sep="\t", header=None, names=["chrom", "start", "end", "d"],
+                            dtype={"chrom": str})
+            b = b[b["chrom"].isin(chroms["chrom"])]
+            bounds = g.set_index("class")[["lower", "upper"]]
+            c = b["chrom"].map(cls)
+            lo = c.map(bounds["lower"]); hi = c.map(bounds["upper"])
+            b["out"] = ((b["d"] < lo) | (b["d"] > hi)).astype(float)
+            b["low"] = (b["d"] < lo).astype(float)
+            pool_bins[pool] = b
+    for pool in pool_bins:
+        rows.append((f"pool:{pool}", f"{pool} out of range"))
+
     longest = int(chroms["length"].max())
     bin_size = max(10_000, int(math.ceil(longest / max_bins / 10_000) * 10_000))
     ml, mr, w = 168, 12, 900
@@ -479,6 +516,16 @@ def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
         sub = reasons_bed[reasons_bed["chrom"] == r.chrom]
         fr = {}
         for k, _ in rows:
+            if k.startswith("pool:"):
+                pb = pool_bins[k[5:]]
+                pb = pb[pb["chrom"] == r.chrom]
+                idx = np.minimum(pb["start"].to_numpy() // bin_size, len(edges) - 2)
+                wgt = (pb["end"] - pb["start"]).to_numpy().astype(float)
+                tot = np.bincount(idx, weights=wgt, minlength=len(edges) - 1)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    fr[k] = np.nan_to_num(np.bincount(idx, weights=wgt * pb["out"].to_numpy(),
+                                                      minlength=len(edges) - 1) / tot)
+                continue
             if k == "any":
                 iv = sub
             elif k == "final":
@@ -486,10 +533,10 @@ def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
             else:
                 iv = sub[np.array([k in w.split(",") for w in sub["why"]], dtype=bool)]
             fr[k] = bin_fraction(iv, L, edges)
-        h = len(rows) * (rowh + gap) + 30
+        h = len(rows) * (rowh + gap) + 30 + (6 if pool_bins else 0)
         g = []
         for j, (k, lab) in enumerate(rows):
-            y = 4 + j * (rowh + gap)
+            y = 4 + j * (rowh + gap) + (6 if k.startswith("pool:") else 0)
             g.append(f'<text class="tick" x="{ml - 8}" y="{y + rowh - 2}" text-anchor="end">{esc(lab)}</text>')
             g.append(f'<rect x="{ml}" y="{y}" width="{L * scale:.1f}" height="{rowh}" fill="var(--page)"/>')
             v = fr[k]
@@ -508,7 +555,7 @@ def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
                     g.append(f'<rect x="{x0:.1f}" y="{y}" width="{max(x1 - x0, 0.6):.1f}" height="{rowh}" '
                              f'fill="{SEQ[steps[b]]}"><title>{esc(tip)}</title></rect>')
                 b = e + 1
-        base = 4 + len(rows) * (rowh + gap) + 2
+        base = 4 + len(rows) * (rowh + gap) + 2 + (6 if pool_bins else 0)
         g.append(f'<line class="ax" x1="{ml}" x2="{ml + L * scale:.1f}" y1="{base}" y2="{base}"/>')
         step_mb = 5 if longest > 20e6 else (1 if longest > 4e6 else 0.1)
         for t in np.arange(0, L / 1e6 + 1e-9, step_mb):
@@ -526,8 +573,10 @@ def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
     more = f" The {max_chroms} longest of {n_all} analysed contigs are shown." if n_all > max_chroms else ""
     return ("<section><h2>Where the mask falls</h2>"
             "<p>Each chromosome drawn to the same scale, with one row per mask reason, then the whole accessibility "
-            "mask, then the final mask grenedalf uses (accessibility plus every pool's depth bounds). Darker = more of "
-            f"the bin masked; hover for values.{more}</p>" + legend + "".join(panels) + "</section>")
+            "mask, then the final mask grenedalf uses (accessibility plus every pool's depth bounds), then each "
+            "pool's share of sites outside its own depth bounds (from 1 kb depth bins). Long dark blocks in a single "
+            "pool are regions that pool covers poorly or excessively (divergent haplotypes, deletions, copy-number "
+            f"changes); scattered speckle is noise. Darker = more of the bin; hover for values.{more}</p>" + legend + "".join(panels) + "</section>")
 
 
 def read_bed3(path):
@@ -670,68 +719,85 @@ def section_chromclass(P):
         return ""
     cc = read_params(f"{P}.chromclass.params")
     x = t[t["class"] == "X"]
-    m = t[t["class"] == "M"]
+    mito = read_tsv(f"{P}.mito.tsv")
     parts = []
     if len(x):
-        # Dot with 95% interval per pool, on the X / autosome depth ratio
+        unreliable = cc.get("X_RATIO_UNRELIABLE") == "1"
+        plaus = x["plausible"].astype(str) == "True" if "plausible" in x else pd.Series(True, index=x.index)
+        # Dot with 95% interval per pool, on the X / autosome depth ratio (peak to peak)
         rowh, ml, w = 28, 100, 620
         h = len(x) * rowh + 52
-        lo_v, hi_v = 0.4, 1.15
+        lo_v = min(0.4, float(x["ci_low"].min()) - 0.05)
+        hi_v = max(1.15, float(x["ci_high"].max()) + 0.05)
         sx = lambda v: ml + (min(max(v, lo_v), hi_v) - lo_v) / (hi_v - lo_v) * (w - ml - 20)
-        g = []
-        for v in (0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1):
+        g = [f'<rect x="{sx(1.0):.1f}" y="18" width="{sx(hi_v) - sx(1.0):.1f}" height="{h - 44}" fill="var(--page)">'
+             f'<title>X depth above autosome depth: not possible from copy number alone</title></rect>']
+        for v in np.arange(np.ceil(lo_v * 10) / 10, hi_v + 1e-9, 0.1):
             g.append(f'<line class="gl" x1="{sx(v):.1f}" x2="{sx(v):.1f}" y1="22" y2="{h - 26}"/>'
                      f'<text class="tick" x="{sx(v):.1f}" y="{h - 10}" text-anchor="middle">{v:.1f}</text>')
         for v, lab, anchor in ((1.0, "no males", "end"), (0.75, "50:50", "middle"), (0.5, "all males", "start")):
             g.append(f'<line x1="{sx(v):.1f}" x2="{sx(v):.1f}" y1="18" y2="{h - 26}" stroke="var(--ink2)" stroke-width="1"/>'
                      f'<text class="ref" x="{sx(v) + {"end": -4, "start": 4, "middle": 0}[anchor]:.1f}" y="14" '
                      f'text-anchor="{anchor}">{lab}</text>')
-        for i, r in enumerate(x.itertuples()):
+        for i, (r, ok) in enumerate(zip(x.itertuples(), plaus)):
             y = 34 + i * rowh
-            col = "var(--s2)" if r.differs else "var(--s1)"
+            col = "var(--s1)" if ok else "var(--neutral)"
             g.append(f'<text class="tick" x="{ml - 8}" y="{y + 4}" text-anchor="end">{esc(r.pool)}</text>')
             g.append(f'<line x1="{sx(r.ci_low):.1f}" x2="{sx(r.ci_high):.1f}" y1="{y}" y2="{y}" stroke="{col}" '
                      f'stroke-width="2" stroke-linecap="round"/>')
-            tip = (f"{r.pool}: X/autosome depth {r.ratio_to_A:.3f} (95% {r.ci_low:.3f}–{r.ci_high:.3f}); "
-                   f"male fraction est. {r.male_fraction_est:.2f}, used {r.male_fraction_used:.2f}; "
-                   f"X pool size {r.pool_size:g}")
+            tip = (f"{r.pool}: X/autosome depth {r.ratio_to_A:.3f} (95% {r.ci_low:.3f}–{r.ci_high:.3f}; "
+                   f"medians {getattr(r, 'ratio_median', np.nan):.3f}); male fraction used {r.male_fraction_used:.2f} "
+                   f"({getattr(r, 'male_fraction_source', '')}); X pool size {r.pool_size:g}")
             g.append(f'<circle cx="{sx(r.ratio_to_A):.1f}" cy="{y}" r="5" fill="{col}" stroke="var(--surface)" stroke-width="2"/>'
                      f'<circle cx="{sx(r.ratio_to_A):.1f}" cy="{y}" r="11" fill="transparent"><title>{esc(tip)}</title></circle>')
         g.append(f'<text class="alabel" x="{(ml + w - 20) / 2:.0f}" y="{h + 6}" text-anchor="middle">'
-                 f'median X depth / median autosome depth (95% block-bootstrap interval)</text>')
+                 f'X depth / autosome depth, peak to peak, well-mapped bins (95% block-bootstrap interval)</text>')
         svg = f'<svg viewBox="0 0 {w} {h + 12}" role="img" aria-label="X to autosome depth ratio">{"".join(g)}</svg>'
-        legend = ('<div class="legend"><span><span class="dotkey" style="background:var(--s2)"></span>differs from autosomes</span>'
-                  '<span><span class="dotkey" style="background:var(--s1)"></span>consistent with autosomes</span></div>')
+        legend = ('<div class="legend"><span><span class="dotkey" style="background:var(--s1)"></span>possible sex ratio (0.5–1)</span>'
+                  '<span><span class="dotkey" style="background:var(--neutral)"></span>outside what a sex ratio can give</span></div>')
+        verdict = ""
+        if unreliable:
+            src = x["male_fraction_source"].iloc[0] if "male_fraction_source" in x else ""
+            verdict += ('<p class="status">' + ICON_BAD + "X depth does not reflect copy number in this data</p>"
+                        "<p>In at least one pool the X has more depth than the autosomes, which no sex ratio can "
+                        "explain: depth is shaped by something else, most likely reference divergence (reads from "
+                        "haplotypes divergent from the reference fail to map, more on the autosomes than the X). "
+                        "So no pool's estimate is used: the male fraction is "
+                        + ("taken from <code>MALE_FRACTION</code>." if src == "known" else
+                           "assumed to be 0.5. <strong>Set <code>MALE_FRACTION</code> from the study design.</strong>")
+                        + "</p>")
         sep = cc.get("X_SEPARATE") == "1"
-        verdict = (f'<p class="status">{ICON_INFO if sep else ICON_OK}'
-                   + ("Analyse the X separately, with its own pool sizes" if sep else "The X can be analysed with the autosomes")
-                   + "</p>")
-        cols = ["pool", "ratio_to_A", "ci_low", "ci_high", "male_fraction_est", "male_fraction_ci"]
-        names_ = ["pool", "X / autosome depth", "95% low", "95% high", "male fraction (est.)", "95% interval"]
-        known = "male_fraction_known" in x and x["male_fraction_known"].notna().any()
-        if known:
-            cols += ["male_fraction_known", "matches_known"]
-            names_ += ["male fraction (known)", "estimate consistent"]
-        tx = x[cols + ["pool_size"]].copy()
-        tx.columns = names_ + ["X pool size"]
-        if known and not x["matches_known"].fillna(True).astype(bool).all():
+        verdict += (f'<p class="status">{ICON_INFO if sep else ICON_OK}'
+                    + ("The X gets its own grenedalf run, with the X pool sizes below" if sep
+                       else "The X can be analysed with the autosomes") + "</p>")
+        cols = [c for c in ["pool", "ratio_to_A", "ci_low", "ci_high", "ratio_median", "male_fraction_est",
+                            "male_fraction_known", "male_fraction_used", "male_fraction_source", "pool_size"] if c in x]
+        tx = x[cols].copy()
+        tx.columns = [{"ratio_to_A": "X / A depth (peaks)", "ci_low": "95% low", "ci_high": "95% high",
+                       "ratio_median": "X / A (medians)", "male_fraction_est": "male fraction (est.)",
+                       "male_fraction_known": "male fraction (known)", "male_fraction_used": "used",
+                       "male_fraction_source": "from", "pool_size": "X pool size"}.get(c, c) for c in cols]
+        if "matches_known" in x and x["male_fraction_known"].notna().any() and not unreliable \
+                and not x["matches_known"].fillna(True).astype(bool).all():
             verdict += ('<p class="status">' + ICON_BAD + "X depth does not match the known sex ratio in at least one "
                         "pool: check the pool composition, or X mappability</p>")
         parts.append("<h3>X chromosome</h3><p>Males carry one X, so in a pool with males the X has lower depth and "
                      "is sampled from fewer copies. With a fraction <em>m</em> of males, X depth / autosome depth = "
                      "1 − <em>m</em>/2 (0.75 for a 50:50 pool), and the X pool size is the pool size × (1 − <em>m</em>/2). "
-                     "The male fraction is estimated from the depth ratio, or taken from <code>MALE_FRACTION</code> when the "
-                     "sex ratio is known, with the estimate kept as a check. If any pool "
-                     "differs from 1 (interval excluding it, by more than 5%), the X gets its own grenedalf run with "
-                     "these pool sizes; otherwise the autosomal pool size would be wrong for the X.</p>"
+                     "The ratio is taken between the peaks of the two depth distributions, over well-mapped bins, "
+                     "because medians are pulled down wherever reads fail to map. <code>MALE_FRACTION</code>, when "
+                     "set, is used instead, with the estimate kept as a check.</p>"
                      + legend + svg + verdict + plain_table(tx))
-    if len(m):
-        tm = m[["pool", "median_depth", "ratio_to_A", "pool_size"]].copy()
-        tm.columns = ["pool", "median depth", "× autosome depth", "pool size (individuals)"]
+    if mito is not None and len(mito):
+        tm = mito[[c for c in ["pool", "median_depth", "ratio_to_A", "lower", "upper", "masked_bp", "pool_size"]
+                   if c in mito]].copy()
+        tm.columns = [{"median_depth": "median depth", "ratio_to_A": "× autosome depth", "lower": "kept from",
+                       "upper": "kept to", "masked_bp": "bp masked", "pool_size": "pool size (individuals)"}.get(c, c)
+                      for c in tm.columns]
         parts.append("<h3>Mitochondrion</h3><p>Many copies per cell, haploid, and one lineage per individual: its "
-                     "depth is far from the autosomes', and its pool size is the number of individuals, not genomes. "
-                     f"It gets its own run, with depth bounds {cc.get('MITO_MIN_DEPTH', '?')}–{cc.get('MITO_MAX_DEPTH', '?')}× "
-                     "and the whole genome as one window.</p>" + plain_table(tm))
+                     "depth is far from the autosomes' and differs between pools (copy number varies), and its pool "
+                     "size is the number of individuals, not genomes. It gets its own run, with each pool's depth "
+                     "bounds applied as that pool's mask, and the whole genome as one window.</p>" + plain_table(tm))
     if not parts:
         return ""
     return "<section><h2>X chromosome and mitochondrion</h2>" + "".join(parts) + "</section>"

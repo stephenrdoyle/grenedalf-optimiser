@@ -370,7 +370,9 @@ step_thresholds() {
 step_chromclass() {
     load_params
     local a=()
-    for n in "${NAMES[@]}"; do a+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz"); done
+    for n in "${NAMES[@]}"; do
+        a+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz" --depth-mq0 "$n" "$OUT/depth/$n.mq0.regions.bed.gz")
+    done
     "${OPTIMISER[@]}" chromclass "${a[@]}" --fai "$FAI" --mask-bed "$MASK_BED" --chrom-regex "$CHROM_REGEX" \
         --x-chroms "$SEX_CHROMS" --mito-chroms "$MITO_CHROMS" --pool-sizes "$POOL_SPEC" \
         ${MALE_FRACTION:+--male-fraction "$MALE_FRACTION"} \
