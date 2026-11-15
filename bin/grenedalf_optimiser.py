@@ -327,9 +327,8 @@ def cmd_mask(args):
             log(f"{chrom}: {row['masked'] / length:.1%} masked")
 
     summary = pd.DataFrame(summary)
-    total = summary.drop(columns="chrom").sum()
-    total["chrom"] = "total"
-    summary = pd.concat([summary, total.to_frame().T], ignore_index=True)
+    total = {"chrom": "total", **summary.drop(columns="chrom").sum().to_dict()}
+    summary = pd.concat([summary, pd.DataFrame([total])], ignore_index=True)
     for reason in list(FLAGS) + ["masked", "accessible"]:
         summary[f"{reason}_frac"] = (summary[reason].astype(float) / summary["length"].astype(float)).round(4)
     summary.to_csv(f"{args.out}.mask_summary.tsv", sep="\t", index=False)

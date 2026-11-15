@@ -180,6 +180,8 @@ any browser. It follows the light/dark setting, with a toggle. Sections:
 - **Recommended settings**: headline numbers and the `params.sh` to use
 - **Accessibility mask**: fraction of each chromosome masked, by reason, and the
   single-pool depth anomalies that were left in
+- **Where the mask falls**: a karyoplot per chromosome (the ten longest analysed contigs),
+  one row per mask reason plus the final mask, shaded by the fraction of each bin masked
 - **Depth per pool**: each pool's depth curve with its kept range, and how much of the
   accessible genome each pool's bounds (and the shared mask) cost
 - **Minimum allele count**: expected error-only sites per Mb at each count

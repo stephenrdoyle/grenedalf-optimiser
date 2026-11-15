@@ -420,6 +420,131 @@ def section_mask(P):
             + (f"<p class='sub'>{esc(note)}</p>" if note else "") + spec_html + "</section>")
 
 
+MASK_ROWS = [("gap", "gap (N)"), ("softmask", "soft-masked"), ("low_mappability", "low mappability"),
+             ("collapsed", "collapsed repeat"), ("ambiguous", "ambiguous mapping"), ("low_depth", "low depth (all pools)")]
+
+
+def covered_upto(starts, ends, xs):
+    """Bases covered by disjoint sorted intervals [starts, ends) to the left of each x."""
+    if len(starts) == 0:
+        return np.zeros(len(xs))
+    cum = np.concatenate(([0], np.cumsum(ends - starts)))
+    i = np.searchsorted(starts, xs, side="right")            # intervals starting before x
+    prev_end = np.where(i > 0, ends[np.clip(i - 1, 0, None)], 0)
+    prev_start = np.where(i > 0, starts[np.clip(i - 1, 0, None)], 0)
+    partial = np.where(i > 0, np.clip(xs - prev_start, 0, prev_end - prev_start), 0)
+    return cum[np.clip(i - 1, 0, None)] * (i > 0) + partial
+
+
+def bin_fraction(iv, length, edges):
+    """Fraction of each bin covered by the (merged) intervals of one chromosome."""
+    s = iv["start"].to_numpy(); e = iv["end"].to_numpy()
+    o = np.argsort(s)
+    c = covered_upto(s[o], e[o], edges.astype(float))
+    return np.diff(c) / np.diff(edges)
+
+
+def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
+    """Where along each chromosome the mask falls: one panel per chromosome (the longest
+    analysed ones), one row per mask reason, colour = fraction of each bin masked."""
+    summary = read_tsv(f"{P}.mask_summary.tsv", dtype={"chrom": str})
+    if summary is None or not os.path.exists(f"{P}.mask_reasons.bed"):
+        return ""
+    chroms = summary[(summary["chrom"] != "total") & (summary["excluded"] < summary["length"])]
+    chroms = chroms.sort_values("length", ascending=False).head(max_chroms)
+    if chroms.empty:
+        return ""
+    reasons_bed = pd.read_csv(f"{P}.mask_reasons.bed", sep="\t", header=None, names=["chrom", "start", "end", "why"],
+                              dtype={"chrom": str})
+    reasons_bed = reasons_bed[reasons_bed["chrom"].isin(chroms["chrom"])]
+    run = read_params(f"{P}.assess.params").get("RECOMMENDED_RUN")
+    final_path = next((f for f in ([os.path.join(out_dir, "grid", run, "mask.total_mask.bed")] if run and out_dir else [])
+                       + [f"{P}.total_mask.bed"] if os.path.exists(f)), None)
+    final = merge_bed(read_bed3(final_path)) if final_path else None
+
+    rows = [(k, lab) for k, lab in MASK_ROWS if (reasons_bed["why"].str.contains(k)).any()]
+    rows.append(("any", "accessibility mask"))
+    if final is not None:
+        rows.append(("final", "final mask (+ depth bounds)"))
+
+    longest = int(chroms["length"].max())
+    bin_size = max(10_000, int(math.ceil(longest / max_bins / 10_000) * 10_000))
+    ml, mr, w = 168, 12, 900
+    rowh, gap = 11, 1
+    scale = (w - ml - mr) / longest
+    panels = []
+    for r in chroms.itertuples():
+        L = int(r.length)
+        edges = np.append(np.arange(0, L, bin_size), L)
+        sub = reasons_bed[reasons_bed["chrom"] == r.chrom]
+        fr = {}
+        for k, _ in rows:
+            if k == "any":
+                iv = sub
+            elif k == "final":
+                iv = final[final["chrom"] == r.chrom]
+            else:
+                iv = sub[np.array([k in w.split(",") for w in sub["why"]], dtype=bool)]
+            fr[k] = bin_fraction(iv, L, edges)
+        h = len(rows) * (rowh + gap) + 30
+        g = []
+        for j, (k, lab) in enumerate(rows):
+            y = 4 + j * (rowh + gap)
+            g.append(f'<text class="tick" x="{ml - 8}" y="{y + rowh - 2}" text-anchor="end">{esc(lab)}</text>')
+            g.append(f'<rect x="{ml}" y="{y}" width="{L * scale:.1f}" height="{rowh}" fill="var(--page)"/>')
+            v = fr[k]
+            # one rect per run of bins with the same shade (keeps the file small)
+            # shade 0 = nothing masked (not drawn); any masking gets at least the lightest shade
+            steps = np.where(v > 0, np.maximum(np.round(np.clip(v, 0, 1) * (len(SEQ) - 1)), 1), 0).astype(int)
+            b = 0
+            while b < len(v):
+                e = b
+                while e + 1 < len(v) and steps[e + 1] == steps[b]:
+                    e += 1
+                if steps[b] > 0:
+                    x0, x1 = edges[b] * scale + ml, edges[e + 1] * scale + ml
+                    tip = (f"{r.chrom}:{edges[b] / 1e6:.2f}-{edges[e + 1] / 1e6:.2f} Mb · {lab}: "
+                           f"{100 * v[b:e + 1].mean():.0f}% masked")
+                    g.append(f'<rect x="{x0:.1f}" y="{y}" width="{max(x1 - x0, 0.6):.1f}" height="{rowh}" '
+                             f'fill="{SEQ[steps[b]]}"><title>{esc(tip)}</title></rect>')
+                b = e + 1
+        base = 4 + len(rows) * (rowh + gap) + 2
+        g.append(f'<line class="ax" x1="{ml}" x2="{ml + L * scale:.1f}" y1="{base}" y2="{base}"/>')
+        step_mb = 5 if longest > 20e6 else (1 if longest > 4e6 else 0.1)
+        for t in np.arange(0, L / 1e6 + 1e-9, step_mb):
+            x = ml + t * 1e6 * scale
+            g.append(f'<line class="ax" x1="{x:.1f}" x2="{x:.1f}" y1="{base}" y2="{base + 4}"/>'
+                     f'<text class="tick" x="{x:.1f}" y="{base + 15}" text-anchor="middle">{t:g}</text>')
+        masked = float(fr["final"].mean() if "final" in fr else fr["any"].mean())
+        panels.append(f"<h3>{esc(r.chrom)} · {L / 1e6:.1f} Mb · {100 * masked:.1f}% masked</h3>"
+                      f'<svg viewBox="0 0 {w} {h}" role="img" aria-label="mask along {esc(r.chrom)}">{"".join(g)}</svg>')
+    key = "".join(f'<span style="display:inline-block;width:22px;height:10px;background:{c}"></span>'
+                  for c in SEQ[1::2])
+    legend = (f'<div class="legend"><span>fraction of each {bin_size / 1e3:g} kb bin masked: 0%&nbsp;{key}&nbsp;100%</span>'
+              f'<span>x axis: Mb</span></div>')
+    n_all = int(((summary["chrom"] != "total") & (summary["excluded"] < summary["length"])).sum())
+    more = f" The {max_chroms} longest of {n_all} analysed contigs are shown." if n_all > max_chroms else ""
+    return ("<section><h2>Where the mask falls</h2>"
+            "<p>Each chromosome drawn to the same scale, with one row per mask reason, then the whole accessibility "
+            "mask, then the final mask grenedalf uses (accessibility plus every pool's depth bounds). Darker = more of "
+            f"the bin masked; hover for values.{more}</p>" + legend + "".join(panels) + "</section>")
+
+
+def read_bed3(path):
+    return pd.read_csv(path, sep="\t", header=None, usecols=[0, 1, 2], names=["chrom", "start", "end"],
+                       dtype={"chrom": str})
+
+
+def merge_bed(df):
+    out = []
+    for c, g in df.sort_values(["chrom", "start"]).groupby("chrom", sort=False):
+        s, e = g["start"].to_numpy(), g["end"].to_numpy()
+        emax = np.maximum.accumulate(e)
+        idx = np.flatnonzero(np.concatenate(([True], s[1:] > emax[:-1])))
+        out.append(pd.DataFrame({"chrom": c, "start": s[idx], "end": np.maximum.reduceat(e, idx)}))
+    return pd.concat(out, ignore_index=True) if out else df
+
+
 def depth_curves(P, dists):
     """Per pool: depth pmf for autosomes and X from mosdepth region.dist (weights from mask summary)."""
     from grenedalf_optimiser import read_dist  # same parser as the thresholds step
@@ -741,7 +866,7 @@ def build_report(args):
         prof = os.path.join(out_dir, "profile")
         dists = [(f[: -len(".mosdepth.region.dist.txt")], os.path.join(prof, f)) for f in sorted(os.listdir(prof))
                  if f.endswith(".mosdepth.region.dist.txt")]
-    sections = [section_summary(P, out_dir), section_mask(P), section_depth(P, dists), section_chromclass(P), section_min_count(P),
+    sections = [section_summary(P, out_dir), section_mask(P), section_karyoplot(P, out_dir), section_depth(P, dists), section_chromclass(P), section_min_count(P),
                 section_ld(P), section_windows(P), section_grid(P)]
     title = args.title or "grenedalf optimiser report"
     page = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
