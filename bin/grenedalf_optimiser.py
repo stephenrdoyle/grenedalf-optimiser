@@ -23,7 +23,7 @@ Subcommands (run in this order; grenedalf_optimiser.sh runs the external tools b
               cut points needed to build depth masks.
   depthmask   per-pool depth masks from mosdepth --quantize output; either merged
               into one mask (shared: every pool is called at the same sites) or kept
-              per sample (grenedalf --filter-mask-sample-bed-list).
+              per sample (grenedalf --filter-mask-samples-bed-list).
   windows     window width from SNP density in a pilot grenedalf table (the smallest
               width at which most windows hold enough SNPs for a precise estimate) and,
               with --ld, no narrower than the linkage scale from the ld step.
@@ -832,26 +832,33 @@ def cmd_commands(args):
     for key, desc, mask_bed, pools, mind, maxd, smasks in runs:
         mito_run = key == "mito"
         L.append(f"# --- {desc}")
-        for cmd in ("diversity", "fst"):
+        # grenedalf computes Tajima's D only with a minimum count of exactly 2: with any other
+        # count, theta pi / Watterson run without it, and Tajima's D gets its own run at 2
+        mc = str(args.min_count)
+        jobs = [("diversity", mc, "", [] if mc == "2" else ["--no-tajima-d"])]
+        if mc != "2":
+            jobs.append(("diversity", "2", "tajimas_d_", ["--no-theta-pi", "--no-theta-watterson"]))
+        jobs.append(("fst", mc, "", [f"--method {args.fst_method}"]))
+        for cmd, count, tag, extra in jobs:
+            if tag:
+                L.append(f"# Tajima's D: grenedalf requires a minimum count of exactly 2 for it")
             c = [f"grenedalf {cmd}"]
             c += [f"--sam-path {b}" for b in args.bam]
             c += [f"--reference-genome-fai {args.fai}",
                   f"--sam-min-map-qual {args.map_qual} --sam-min-base-qual {args.base_qual}",
                   f"--filter-mask-total-bed {mask_bed}"]
             if smasks:
-                c.append(f"--filter-mask-sample-bed-list {smasks}")
-            c += [f"--filter-sample-min-count {args.min_count}",
+                c.append(f"--filter-mask-samples-bed-list {smasks}")
+            c += [f"--filter-sample-min-count {count}",
                   f"--filter-sample-min-read-depth {mind} --filter-sample-max-read-depth {maxd}"]
             if mito_run:
                 c.append("--window-type chromosomes")
             else:
                 c.append(f"--window-type interval --window-interval-width {args.window} "
                          f"--window-interval-stride {args.stride}")
-            c += ["--window-average-policy valid-loci", f"--pool-sizes {pools}"]
-            if cmd == "fst":
-                c.append(f"--method {args.fst_method}")
+            c += ["--window-average-policy valid-loci", f"--pool-sizes {pools}"] + extra
             c += ["--separator-char tab --threads $THREADS",
-                  f"--out-dir $OUTDIR/{key} --file-prefix {key}_"]
+                  f"--out-dir $OUTDIR/{key} --file-prefix {key}_{tag}"]
             L.append(" \\\n    ".join(c))
             L.append("")
     if args.min_snps:

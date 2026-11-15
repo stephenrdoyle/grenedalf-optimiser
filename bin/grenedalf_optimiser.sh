@@ -114,7 +114,17 @@ conda_init() {
 }
 
 conda_env_exists() {
-    [[ -d "$CONDA_ENV" ]] || conda env list | awk '$1 !~ /^#/ {print $1; print $NF}' | grep -qx -- "$CONDA_ENV"
+    [[ -d "$CONDA_ENV" ]] && return 0
+    # Names and paths of all environments (an environment outside envs_dirs is listed by path
+    # only, so its directory name counts too). The list is read in full before matching:
+    # "grep -q" inside a pipeline can exit early and fail the pipeline under pipefail.
+    local list rc=0
+    set +u                                  # conda's shell function may use unset variables
+    list=$(conda env list 2> /dev/null) || rc=$?
+    set -u
+    [[ $rc == 0 ]] || return 1
+    CONDA_ENVS_SEEN=$(awk '$1 !~ /^#/ && NF {print $1; print $NF; n = split($NF, p, "/"); print p[n]}' <<<"$list")
+    [[ $'\n'"$CONDA_ENVS_SEEN"$'\n' == *$'\n'"$CONDA_ENV"$'\n'* ]]
 }
 
 activate_env() {
@@ -130,6 +140,7 @@ activate_env() {
         log "conda environment: $CONDA_ENV"
     else
         log "conda environment $CONDA_ENV not found (create it with the setup step); using tools on PATH"
+        log "  environments conda lists: $(awk '!seen[$0]++' <<<"${CONDA_ENVS_SEEN:-}" | grep -v / | head -10 | tr '\n' ' ')"
     fi
 }
 
@@ -190,7 +201,7 @@ load_params() {
 check_grenedalf() {
     local help
     help=$("$GRENEDALF" diversity --help 2>&1)
-    for opt in --filter-mask-total-bed --filter-mask-sample-bed-list ${REGION:+--filter-region} \
+    for opt in --filter-mask-total-bed --filter-mask-samples-bed-list ${REGION:+--filter-region} \
                --filter-sample-min-count --filter-sample-min-read-depth --filter-sample-max-read-depth \
                --allow-file-overwriting; do
         grep -q -- "$opt" <<<"$help" || { echo "grenedalf diversity has no $opt; this tool needs grenedalf >= 0.6" >&2; exit 1; }
@@ -209,11 +220,16 @@ run_grenedalf() {
                 --window-average-policy valid-loci
                 --pool-sizes "$POOL_SIZE_ARG" --separator-char tab --out-dir "$dir" --allow-file-overwriting)
     if [[ -n "$REGION" ]]; then args+=(--filter-region "$REGION"); fi
-    if [[ -n "$sample_masks" ]]; then args+=(--filter-mask-sample-bed-list "$sample_masks"); fi
+    if [[ -n "$sample_masks" ]]; then args+=(--filter-mask-samples-bed-list "$sample_masks"); fi
     for bam in "${BAMS[@]}"; do args+=(--sam-path "$bam"); done
     mkdir -p "$dir"
-    "$GRENEDALF" diversity "${args[@]}" > "$dir/diversity.log" 2>&1
-    "$GRENEDALF" fst "${args[@]}" --method "$FST_METHOD" > "$dir/fst.log" 2>&1
+    # grenedalf computes Tajima's D only with a minimum count of exactly 2
+    local tajima=()
+    [[ $mc != 2 ]] && tajima=(--no-tajima-d)
+    "$GRENEDALF" diversity "${args[@]}" ${tajima[@]+"${tajima[@]}"} > "$dir/diversity.log" 2>&1 \
+        || { tail -5 "$dir/diversity.log" >&2; return 1; }
+    "$GRENEDALF" fst "${args[@]}" --method "$FST_METHOD" > "$dir/fst.log" 2>&1 \
+        || { tail -5 "$dir/fst.log" >&2; return 1; }
 }
 
 step_check() {
@@ -236,14 +252,14 @@ step_check() {
     fi
     if command -v "$GRENEDALF" > /dev/null; then
         local help opt
+        local missing_opts=0
         help=$("$GRENEDALF" diversity --help 2>&1)
-        for opt in --filter-mask-total-bed --filter-mask-sample-bed-list --filter-sample-min-count \
+        for opt in --filter-mask-total-bed --filter-mask-samples-bed-list --filter-sample-min-count \
                    --filter-sample-min-read-depth --filter-sample-max-read-depth --allow-file-overwriting \
-                   --pool-sizes ${REGION:+--filter-region}; do
-            grep -q -- "$opt" <<<"$help" || bad "grenedalf diversity has no $opt"
+                   --pool-sizes --no-tajima-d ${REGION:+--filter-region}; do
+            if ! grep -q -- "$opt" <<<"$help"; then bad "grenedalf diversity has no $opt"; missing_opts=1; fi
         done
-        ok "grenedalf options present"
-        grep -A3 -- "--pool-sizes" <<<"$help" | sed 's/^/      /'
+        [[ $missing_opts == 0 ]] && ok "grenedalf options present ($(grep -o -m1 -E 'v?[0-9]+\.[0-9]+\.[0-9]+' <<<"$("$GRENEDALF" --version 2>&1)" || echo "version unknown"))"
     fi
 
     echo "inputs"
@@ -449,7 +465,7 @@ STRIDE=$STRIDE
 MIN_SNPS=$MIN_SNPS
 # Ready-to-run commands, one run per chromosome class: $OUT/grenedalf_commands.sh
 # grenedalf ... --filter-mask-total-bed \$TOTAL_MASK_BED \\
-#     \${SAMPLE_MASK_LIST:+--filter-mask-sample-bed-list \$SAMPLE_MASK_LIST} \\
+#     \${SAMPLE_MASK_LIST:+--filter-mask-samples-bed-list \$SAMPLE_MASK_LIST} \\
 #     --filter-sample-min-count \$MIN_COUNT \\
 #     --filter-sample-min-read-depth \$MIN_DEPTH --filter-sample-max-read-depth \$MAX_DEPTH \\
 #     --sam-min-map-qual \$MAPQ --sam-min-base-qual \$BASEQ \\

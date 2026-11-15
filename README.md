@@ -72,8 +72,7 @@ one LSF job when `bsub` is available (queue `LSF_QUEUE`, memory `LSF_MEM`, cores
 `OUT/logs/`, the report to `OUT/optimiser_report.html`.
 
 `check` on its own takes a minute or two and catches most setup problems: tools and
-python packages, grenedalf's options (it prints its `--pool-sizes` help so the per-pool
-file format can be confirmed), BAMs and their indexes, BAM contig names against the
+python packages, grenedalf's options, BAMs and their indexes, BAM contig names against the
 reference, and which contigs the regexes pick up as autosomes, X and mitochondrion.
 
 Or run one step at a time (`setup check mask profile thresholds chromclass quantize depthmask pilot grid params report`).
@@ -141,8 +140,8 @@ step does this).
 These depend on grenedalf behaviour that could not be tested here (written against the
 0.6.3 documentation):
 
-- `check_grenedalf` stops the run if `--filter-mask-total-bed`, `--filter-mask-sample-bed-list`
-  or `--filter-region` is missing from `grenedalf diversity --help`.
+- `check` stops the run if any grenedalf option the tool uses is missing from
+  `grenedalf diversity --help` (written against grenedalf 0.6.3).
 - `windows.txt` reports whether `total.masked` in the pilot table matches the BED. If it
   says *WRONG WAY ROUND*, grenedalf treats the BED as the regions to keep.
 - The per-sample mask list is written as `sample<TAB>bed`. Check this against
@@ -151,12 +150,16 @@ These depend on grenedalf behaviour that could not be tested here (written again
   differs in GC content or mappability, its depth (and so the estimate) shifts. When the
   sex ratio is known from the design, set `MALE_FRACTION` (for example 0.5): the known value
   then sets the X pool size, and the report flags pools whose X depth does not match it.
-- Per-pool `--pool-sizes` files (when pools differ, and for the X and mito runs) are written as
-  `sample<TAB>size`. Check this format against `grenedalf --help`.
 - Pool names are taken from the BAM file names without the extension, as grenedalf
   names samples. They must match the column prefixes in grenedalf's tables.
 
 ## Limits
+
+- **Tajima's D needs a minimum count of exactly 2** in grenedalf (Kofler et al.'s
+  correction assumes singletons are removed). When the recommended minimum count is not 2,
+  θπ, θW and FST use the recommended count, and Tajima's D gets its own diversity run at 2
+  (`grenedalf_commands.sh` writes both). Grid runs with a count other than 2 leave
+  Tajima's D out of the artefact score.
 
 - The depth bounds use mosdepth depth (MAPQ filtered, not base-quality filtered), so they
   sit a few percent above grenedalf's own depth at the same site.

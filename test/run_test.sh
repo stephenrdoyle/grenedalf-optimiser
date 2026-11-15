@@ -96,5 +96,10 @@ for run in autosomes X mito; do
 done
 grep -q -- "--pool-sizes $D/optimiser.x_pool_sizes.tsv" "$D/grenedalf_commands.sh" || fail "X run without X pool sizes"
 bash -n "$D/grenedalf_commands.sh" || fail "grenedalf_commands.sh is not valid bash"
+# min count 3: theta pi / Watterson without Tajima's D, and a separate Tajima's D run at count 2
+grep -q -- "--no-tajima-d" "$D/grenedalf_commands.sh" || fail "diversity at min count 3 without --no-tajima-d"
+awk '/file-prefix autosomes_tajimas_d_/ {t=1} END {exit !t}' "$D/grenedalf_commands.sh" || fail "no separate Tajima's D run"
+awk 'BEGIN {RS=""} /tajimas_d_/ && !/--filter-sample-min-count 2 / {bad=1} END {exit bad}' "$D/grenedalf_commands.sh" \
+    || fail "Tajima's D run not at min count 2"
 
 echo "all checks passed ($D)"

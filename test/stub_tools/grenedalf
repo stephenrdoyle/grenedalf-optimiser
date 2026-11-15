@@ -1,15 +1,30 @@
 #!/usr/bin/env bash
-# Stand-in for grenedalf: --help lists the options the driver checks; commands copy the
-# simulated "clean" tables, or the simulated frequency table.
+# Stand-in for grenedalf 0.6.3: --help lists the options the driver checks; commands copy the
+# simulated "clean" tables, or the simulated frequency table. Like the real one, diversity
+# refuses Tajima's D unless --filter-sample-min-count is 2 (or --no-tajima-d is given).
 set -euo pipefail
+if [[ ${1:-} == --version ]]; then echo "grenedalf v0.6.3 (stand-in)"; exit 0; fi
 cmd=$1; shift
 if [[ ${1:-} == --help ]]; then
-    echo "--filter-mask-total-bed --filter-mask-sample-bed-list --filter-region --filter-sample-min-count"
-    echo "--filter-sample-min-read-depth --filter-sample-max-read-depth --allow-file-overwriting"
+    echo "--filter-mask-total-bed --filter-mask-samples-bed-list --filter-region --filter-sample-min-count"
+    echo "--filter-sample-min-read-depth --filter-sample-max-read-depth --allow-file-overwriting --no-tajima-d"
     echo "--pool-sizes  Pool sizes: a single number, or a file with sample name and size"
     exit 0
 fi
-while [[ $# -gt 0 ]]; do [[ $1 == --out-dir ]] && out=$2; shift; done
+mc="" no_tajima=0 out=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --out-dir) out=$2 ;;
+        --filter-sample-min-count) mc=$2 ;;
+        --no-tajima-d) no_tajima=1 ;;
+        --filter-mask-sample-bed-list) echo "unknown option $1" >&2; exit 1 ;;
+    esac
+    shift
+done
+if [[ $cmd == diversity && $no_tajima == 0 && $mc != 2 ]]; then
+    echo "--filter-sample-min-count: Tajima's D requires the minimum allele count to be exactly 2" >&2
+    exit 1
+fi
 case $cmd in
     diversity) cp "$SIM_DIR/clean.diversity.csv" "$out/diversity.csv" ;;
     fst) cp "$SIM_DIR/clean.fst.csv" "$out/fst.csv" ;;
