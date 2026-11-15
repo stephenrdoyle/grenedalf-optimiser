@@ -8,11 +8,15 @@
 #   mask       GenMap mappability + mosdepth depth bins -> accessibility mask
 #   profile    per-pool depth distribution in the accessible genome, samtools stats
 #   thresholds per-pool depth bounds, minimum allele count, quantize cut points
+#   chromclass do X and mitochondrion depth differ from autosomes? (separate runs, pool sizes)
 #   quantize   mosdepth --quantize per pool at those cut points
 #   depthmask  depth masks for the recommended bounds
-#   pilot      grenedalf on the pilot region -> linkage scale, window width, mask check
-#   grid       grenedalf on the pilot region over a grid of settings -> technical assessment
-#   params     write OUT/params.sh for the full grenedalf run
+#   pilot      grenedalf with the recommended settings -> linkage scale, window width, mask check
+#   grid       grenedalf over a grid of settings -> technical assessment
+#   params     OUT/params.sh and OUT/grenedalf_commands.sh for the full grenedalf run
+#
+# pilot and grid use the whole genome unless REGION is set (e.g. one chromosome for a quick trial).
+#   report     OUT/optimiser_report.html: every step's results in one self-contained page
 #
 # Needs on PATH (or set in the config): python3 with numpy and pandas, mosdepth,
 # samtools, genmap (unless MAPPABILITY_BEDGRAPH is given) and grenedalf.
@@ -38,6 +42,9 @@ SOFTMASK=0
 BIN=1000
 CHROM_REGEX=.
 X_REGEX='chrX|_X_|^X$'
+MITO_REGEX='mitochondri|^chrM$|^MT$|mtDNA'
+REGION=               # empty: whole genome (recommended); or a grenedalf --filter-region for a quick trial
+POOL_SIZES=           # per-pool sizes, POOL=N,POOL=N (overrides POOL_SIZE)
 MAPQ=30
 BASEQ=30
 MIN_FOLD=0.5
@@ -46,7 +53,7 @@ ABS_MIN_DEPTH=10
 GRID_MIN_FOLDS=0.33,0.67
 GRID_MAX_FOLDS=1.5,3.0
 TARGET_SNPS=50
-LD_REGION=            # chromosomes for the linkage scale (space separated); default: the pilot chromosome
+LD_REGION=            # chromosomes for the linkage scale (space separated); default: all analysed
 LD_MAX_DIST=100000
 PILOT_WINDOW=5000
 FST_METHOD=unbiased-nei
@@ -58,9 +65,10 @@ GENMAP=genmap
 # shellcheck source=/dev/null
 source "$CONFIG"
 
-: "${REF:?set REF in the config}" "${FAI:?set FAI}" "${OUT:?set OUT}" "${POOL_SIZE:?set POOL_SIZE}"
-: "${PILOT_REGION:?set PILOT_REGION (e.g. one autosome)}"
+: "${REF:?set REF in the config}" "${FAI:?set FAI}" "${OUT:?set OUT}"
+[[ -n "${POOL_SIZE:-}${POOL_SIZES:-}" ]] || { echo "set POOL_SIZE (or POOL_SIZES) in the config" >&2; exit 1; }
 [[ ${#BAMS[@]} -gt 0 ]] || { echo "set BAMS=(...) in the config" >&2; exit 1; }
+REGION=${REGION:-${PILOT_REGION:-}}   # PILOT_REGION: older configs
 
 # Pools are named as grenedalf names samples: the BAM file name without its extension
 NAMES=()
@@ -73,10 +81,22 @@ mkdir -p "$OUT"/{mappability,depth,profile,quantize,pilot,grid}
 OUT=$(cd "$OUT" && pwd)
 P="$OUT/optimiser"
 
+# Pool sizes: POOL_SPEC for the python steps; POOL_SIZE_ARG for grenedalf --pool-sizes
+# (a number, or a sample<TAB>size file when the pools differ)
+if [[ -n "${POOL_SIZES:-}" ]]; then
+    POOL_SPEC=$POOL_SIZES
+    POOL_SIZE_ARG="$OUT/pool_sizes.tsv"
+    tr ',' '\n' <<<"$POOL_SIZES" | tr '=' '\t' > "$POOL_SIZE_ARG"
+else
+    POOL_SPEC=$POOL_SIZE
+    POOL_SIZE_ARG=$POOL_SIZE
+fi
+
 log() { echo "[$(date '+%F %T')] $*" >&2; }
 
 load_params() {
-    for f in "$P".mask.params "$P".thresholds.params "$P".depthmask.params "$P".windows.params "$P".assess.params; do
+    for f in "$P".mask.params "$P".thresholds.params "$P".chromclass.params "$P".depthmask.params \
+             "$P".windows.params "$P".assess.params; do
         # shellcheck source=/dev/null
         [[ -f "$f" ]] && source "$f"
     done
@@ -86,7 +106,7 @@ load_params() {
 check_grenedalf() {
     local help
     help=$("$GRENEDALF" diversity --help 2>&1)
-    for opt in --filter-mask-total-bed --filter-mask-sample-bed-list --filter-region \
+    for opt in --filter-mask-total-bed --filter-mask-sample-bed-list ${REGION:+--filter-region} \
                --filter-sample-min-count --filter-sample-min-read-depth --filter-sample-max-read-depth \
                --allow-file-overwriting; do
         grep -q -- "$opt" <<<"$help" || { echo "grenedalf diversity has no $opt; this tool needs grenedalf >= 0.6" >&2; exit 1; }
@@ -98,14 +118,14 @@ run_grenedalf() {
     local dir=$1 mask=$2 sample_masks=$3 mc=$4 mind=$5 maxd=$6 width=$7 stride=$8
     local args=(--reference-genome-fai "$FAI" --threads "$THREADS"
                 --sam-min-map-qual "$MAPQ" --sam-min-base-qual "$BASEQ"
-                --filter-region "$PILOT_REGION"
                 --filter-mask-total-bed "$mask"
                 --filter-sample-min-count "$mc"
                 --filter-sample-min-read-depth "$mind" --filter-sample-max-read-depth "$maxd"
                 --window-type interval --window-interval-width "$width" --window-interval-stride "$stride"
                 --window-average-policy valid-loci
-                --pool-sizes "$POOL_SIZE" --separator-char tab --out-dir "$dir" --allow-file-overwriting)
-    [[ -n "$sample_masks" ]] && args+=(--filter-mask-sample-bed-list "$sample_masks")
+                --pool-sizes "$POOL_SIZE_ARG" --separator-char tab --out-dir "$dir" --allow-file-overwriting)
+    if [[ -n "$REGION" ]]; then args+=(--filter-region "$REGION"); fi
+    if [[ -n "$sample_masks" ]]; then args+=(--filter-mask-sample-bed-list "$sample_masks"); fi
     for bam in "${BAMS[@]}"; do args+=(--sam-path "$bam"); done
     mkdir -p "$dir"
     "$GRENEDALF" diversity "${args[@]}" > "$dir/diversity.log" 2>&1
@@ -160,7 +180,16 @@ step_thresholds() {
     "${OPTIMISER[@]}" thresholds "${a[@]}" --mask-summary "$P.mask_summary.tsv" --x-regex "$X_REGEX" \
         --min-fold "$MIN_FOLD" --max-fold "$MAX_FOLD" --abs-min-depth "$ABS_MIN_DEPTH" \
         --grid-min-folds "$GRID_MIN_FOLDS" --grid-max-folds "$GRID_MAX_FOLDS" \
-        --base-qual "$BASEQ" --map-qual "$MAPQ" --out "$P"
+        --base-qual "$BASEQ" --map-qual "$MAPQ" --pool-sizes "$POOL_SPEC" --out "$P"
+}
+
+step_chromclass() {
+    load_params
+    local a=()
+    for n in "${NAMES[@]}"; do a+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz"); done
+    "${OPTIMISER[@]}" chromclass "${a[@]}" --fai "$FAI" --mask-bed "$MASK_BED" --chrom-regex "$CHROM_REGEX" \
+        --x-regex "$X_REGEX" --mito-regex "$MITO_REGEX" --pool-sizes "$POOL_SPEC" \
+        --min-fold "$MIN_FOLD" --max-fold "$MAX_FOLD" --abs-min-depth "$ABS_MIN_DEPTH" --out "$P"
 }
 
 step_quantize() {
@@ -201,8 +230,9 @@ step_pilot() {
             --write-sample-counts --separator-char tab --compress \
             --out-dir "$OUT/pilot" --allow-file-overwriting > "$OUT/pilot/frequency.log" 2>&1
     fi
+    local ld_region=${LD_REGION:-${REGION%%:*}}
     # shellcheck disable=SC2086
-    "${OPTIMISER[@]}" ld --frequency "$OUT/pilot/frequency.csv.gz" --region ${LD_REGION:-${PILOT_REGION%%:*}} \
+    "${OPTIMISER[@]}" ld --frequency "$OUT/pilot/frequency.csv.gz" ${ld_region:+--region $ld_region} \
         --mask-bed "$TOTAL_MASK_BED" --min-count "$MIN_COUNT" --min-depth "$MIN_DEPTH" --max-depth "$MAX_DEPTH" \
         --max-dist "$LD_MAX_DIST" --out "$P"
     "${OPTIMISER[@]}" windows --table "$OUT/pilot/diversity.csv" --target-snps "$TARGET_SNPS" \
@@ -257,11 +287,16 @@ SAMPLE_MASK_LIST=$SAMPLE_MASK_LIST
 MIN_COUNT=$mc
 MIN_DEPTH=$MIN_DEPTH
 MAX_DEPTH=$MAX_DEPTH
+POOL_SIZES=$POOL_SIZE_ARG
+X_SEPARATE=${X_SEPARATE:-0}
+X_POOL_SIZES=${X_POOL_SIZES:-}
+MITO_SEPARATE=${MITO_SEPARATE:-0}
 MAPQ=$MAPQ
 BASEQ=$BASEQ
 WINDOW=$WINDOW
 STRIDE=$STRIDE
 MIN_SNPS=$MIN_SNPS
+# Ready-to-run commands, one run per chromosome class: $OUT/grenedalf_commands.sh
 # grenedalf ... --filter-mask-total-bed \$TOTAL_MASK_BED \\
 #     \${SAMPLE_MASK_LIST:+--filter-mask-sample-bed-list \$SAMPLE_MASK_LIST} \\
 #     --filter-sample-min-count \$MIN_COUNT \\
@@ -272,10 +307,19 @@ MIN_SNPS=$MIN_SNPS
 EOF
     log "wrote $OUT/params.sh"
     cat "$OUT/params.sh"
+    "${OPTIMISER[@]}" commands --prefix "$P" --out-dir "$OUT" --fai "$FAI" --bam "${BAMS[@]}" --x-regex "$X_REGEX" \
+        --total-mask "$TOTAL_MASK_BED" --sample-masks "$SAMPLE_MASK_LIST" --pool-size-arg "$POOL_SIZE_ARG" \
+        --min-count "$mc" --min-depth "$MIN_DEPTH" --max-depth "$MAX_DEPTH" --window "$WINDOW" --stride "$STRIDE" \
+        --min-snps "$MIN_SNPS" --map-qual "$MAPQ" --base-qual "$BASEQ" --fst-method "$FST_METHOD" --threads "$THREADS"
+}
+
+step_report() {
+    "${OPTIMISER[@]}" report --prefix "$P" --out-dir "$OUT" --out "$OUT/optimiser_report.html" \
+        ${REPORT_TITLE:+--title "$REPORT_TITLE"}
 }
 
 case "$STEP" in
-    mask|profile|thresholds|quantize|depthmask|pilot|grid|params) "step_$STEP" ;;
-    all) for s in mask profile thresholds quantize depthmask pilot grid params; do log "== $s"; "step_$s"; done ;;
+    mask|profile|thresholds|chromclass|quantize|depthmask|pilot|grid|params|report) "step_$STEP" ;;
+    all) for s in mask profile thresholds chromclass quantize depthmask pilot grid params report; do log "== $s"; "step_$s"; done ;;
     *) echo "unknown step: $STEP" >&2; exit 1 ;;
 esac

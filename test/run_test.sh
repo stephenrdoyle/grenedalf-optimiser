@@ -24,7 +24,12 @@ for p in "${POOLS[@]}"; do depth+=(--depth "$p" "$D/$p.mq0.regions.bed.gz" "$D/$
 "${SIM[@]}" dist "$D"
 a=()
 for p in "${POOLS[@]}"; do a+=(--dist "$p" "$D/$p.mosdepth.region.dist.txt" --stats "$p" "$D/$p.stats"); done
-"${OPTIMISER[@]}" thresholds "${a[@]}" --mask-summary "$D/optimiser.mask_summary.tsv" --out "$D/optimiser"
+"${OPTIMISER[@]}" thresholds "${a[@]}" --mask-summary "$D/optimiser.mask_summary.tsv" --pool-sizes 400 --out "$D/optimiser"
+
+c=()
+for p in "${POOLS[@]}"; do c+=(--depth "$p" "$D/$p.mq30.regions.bed.gz"); done
+"${OPTIMISER[@]}" chromclass "${c[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --chrom-regex sim_ \
+    --mito-regex mito --pool-sizes 400 --out "$D/optimiser"
 
 "${SIM[@]}" quantize "$D"
 q=()
@@ -45,6 +50,10 @@ for p in "${POOLS[@]}"; do r+=(--depth "$p" "$D/$p.mq30.regions.bed.gz"); done
 "${OPTIMISER[@]}" assess --run clean "$D/clean.diversity.csv" "$D/clean.fst.csv" \
     --run artefact "$D/artefact.diversity.csv" "$D/artefact.fst.csv" "${r[@]}" \
     --strict clean --min-snps 20 --out "$D/optimiser"
+
+"${OPTIMISER[@]}" commands --prefix "$D/optimiser" --out-dir "$D" --fai "$D/ref.fa.fai" \
+    --bam "${POOLS[@]/%/.bam}" --total-mask "$D/optimiser.total_mask.bed" --pool-size-arg 400 \
+    --min-count 3 --min-depth 10 --max-depth 282 --window 6000 --stride 3000 --min-snps 50
 
 # --- checks
 reasons=$(cut -f4 "$D/optimiser.mask_reasons.bed" | tr ',' '\n' | sort -u | tr '\n' ' ')
@@ -67,5 +76,15 @@ source "$D/optimiser.ld.params"
 [[ $LD_D10 != NA && $LD_D10 -ge 1000 && $LD_D10 -le 8000 ]] || fail "LD_D10 $LD_D10 not near the simulated 2 kb scale"
 source "$D/optimiser.windows.params"
 [[ $WINDOW -ge $LD_D10 ]] || fail "window $WINDOW narrower than the linkage scale $LD_D10"
+
+# X simulated at half depth (all males): separate run, X pool size 200; mito always separate
+source "$D/optimiser.chromclass.params"
+[[ $X_SEPARATE == 1 && $MITO_SEPARATE == 1 ]] || fail "X / mito not flagged for separate runs"
+awk -F'\t' '$2 < 180 || $2 > 220 {bad=1} END {exit bad}' "$D/optimiser.x_pool_sizes.tsv" || fail "X pool sizes not ~200"
+for run in autosomes X mito; do
+    grep -q -- "--out-dir \$OUTDIR/$run " "$D/grenedalf_commands.sh" || fail "no $run run in grenedalf_commands.sh"
+done
+grep -q -- "--pool-sizes $D/optimiser.x_pool_sizes.tsv" "$D/grenedalf_commands.sh" || fail "X run without X pool sizes"
+bash -n "$D/grenedalf_commands.sh" || fail "grenedalf_commands.sh is not valid bash"
 
 echo "all checks passed ($D)"

@@ -25,11 +25,13 @@ with the strictest setting tried.
 |---|---|---|
 | `mask` | GenMap, mosdepth | **Accessibility mask**, the same for all pools: reference gaps; low mappability (most k-mers covering a base are not unique, so reads there get MAPQ 0 and the site looks "missing"); collapsed repeats (consensus depth > 2× the chromosome median: extra genomic copies stacked on one reference copy); ambiguous mapping (consensus: most reads below the MAPQ cut-off, which catches repeats GenMap cannot see because the reference lacks them); sequence absent from every pool. Optionally soft-masked repeats. Depth anomalies in **single** pools (deletions, CNVs) are written to `optimiser.pool_specific_depth.tsv` and **not masked**, because they may be biology. |
 | `profile` | mosdepth, samtools | Each pool's depth distribution **inside the accessible genome only**, so repeats and gaps do not distort it. |
-| `thresholds` | – | **Per-pool depth bounds**, autosomes and X separately (the X runs at lower depth when males are in the pool): fold × that pool's median. A single 30–300 for every pool removes a different fraction of the genome from a 60× pool than from a 150× pool. **Minimum allele count**: the smallest count that sequencing errors alone rarely reach at the pool's depth, given the base-quality cut-off. |
+| `thresholds` | – | **Per-pool depth bounds**, autosomes and X separately (the X runs at lower depth when males are in the pool): fold × that pool's median. A single 30–300 for every pool removes a different fraction of the genome from a 60× pool than from a 150× pool. **Minimum allele count**: the smallest count that sequencing errors alone rarely reach at the pool's depth, given the base-quality cut-off. With the **pool size**: the effective number of chromosomes sampled at each pool's depth (n_eff = d·n / (d + n − 1)), and the lowest allele frequency the minimum count can see against one copy in the pool. |
+| `chromclass` | – | **X and mitochondrion**: each pool's X and mito depth against its autosomes, with a block-bootstrap 95% interval. Pools with males have X depth = 1 − m/2 of autosome depth (m = male fraction), so the X is sampled from fewer copies and needs its own pool size, pool size × (1 − m/2). If any pool's X differs from the autosomes, the X gets its own grenedalf run with per-pool X pool sizes. The mitochondrion (haploid, many copies, one lineage per individual) always gets its own run, with its own depth bounds and a pool size of the number of individuals. |
 | `quantize`, `depthmask` | mosdepth | Applies the per-pool bounds as BED masks. grenedalf has only one global depth filter, so per-pool bounds have to go in as masks. `shared` mode (default) merges them, so every pool is called at exactly the same sites. `per-sample` keeps more sites at the cost of uneven missingness; the grid tests both. |
-| `pilot` | grenedalf | One chromosome with the recommended settings. **Linkage scale** (`ld`): how far apart two SNPs have to be before their allele frequencies vary independently across pools (an LD decay for pool-seq, no phasing needed). **Window width**: wide enough for `TARGET_SNPS` SNPs in 90% of windows, and no narrower than the linkage scale. Also checks that grenedalf applied the mask the right way round. |
-| `grid` | grenedalf | Pilot chromosome rerun with one setting changed at a time: minimum count ±1, lower and upper depth folds, per-sample masks, and no accessibility mask. `assess` scores each run, and the most permissive run that adds no artefact is recommended. |
-| `params` | – | `OUT/params.sh` for the genome-wide run. |
+| `pilot` | grenedalf | The whole genome with the recommended settings. **Linkage scale** (`ld`): how far apart two SNPs have to be before their allele frequencies vary independently across pools (an LD decay for pool-seq, no phasing needed). **Window width**: wide enough for `TARGET_SNPS` SNPs in 90% of windows, and no narrower than the linkage scale. Also checks that grenedalf applied the mask the right way round. |
+| `grid` | grenedalf | The whole genome rerun with one setting changed at a time: minimum count ±1, lower and upper depth folds, per-sample masks, and no accessibility mask. `assess` scores each run, and the most permissive run that adds no artefact is recommended. |
+| `params` | – | `OUT/params.sh`, and `OUT/grenedalf_commands.sh`: ready-to-run grenedalf commands with every chosen value filled in, one run per chromosome class (nuclear, or autosomes + X, plus mitochondrion). |
+| `report` | – | `OUT/optimiser_report.html`: every step's results on one page (see below). |
 
 ### The linkage scale
 
@@ -51,17 +53,36 @@ Requirements: python3 with numpy and pandas; mosdepth, samtools, GenMap and gren
 (≥ 0.6) on `PATH` or set in the config; bash (3.2 or later).
 
 ```bash
-cp config.example.sh my_config.sh    # edit paths, pools, pilot chromosome
+cp config.example.sh my_config.sh    # edit paths, pools, pool sizes
 bin/grenedalf_optimiser.sh my_config.sh all
 ```
 
-Or run one step at a time (`mask profile thresholds quantize depthmask pilot grid params`).
+Or run one step at a time (`mask profile thresholds chromclass quantize depthmask pilot grid params report`).
 Each step reads what the previous ones wrote in `OUT/`. On the farm, for example:
 
 ```bash
 bsub -n 8 -R "span[hosts=1] select[mem>16000] rusage[mem=16000]" -M 16000 \
     -o optimiser.%J.o -e optimiser.%J.e bin/grenedalf_optimiser.sh my_config.sh all
 ```
+
+The `pilot` and `grid` steps run on the **whole genome** by default, so the settings
+are judged on every chromosome rather than on one that may not be typical. The grid
+is about ten genome-wide grenedalf diversity + FST runs, so it is the slow step
+(hours, not minutes). For a quick trial, set `REGION` to one chromosome.
+
+### How the grid affects the recommendation
+
+The grid decides the **minimum count**, the **depth bounds** (lower and upper fold)
+and the **mask mode** (shared or per sample). The recommended setting is one of the grid runs,
+and `params.sh`, `grenedalf_commands.sh` and the report all use that run. If a looser
+minimum count or wider depth bounds add no artefact, they replace the starting values,
+because they keep more data. If they do add artefact, the starting values stand. The
+`no_accessibility_mask` run is a check, not a candidate: it shows what the mask removes
+and is only chosen if the mask turns out not to matter.
+
+The grid does **not** change the accessibility mask, the window width (from SNP
+density and the linkage scale), the X / mitochondrion decision, or the read filters
+(MAPQ, base quality).
 
 The memory goes on GenMap indexing and on the mask step, which holds one chromosome as
 per-base arrays and the GenMap bedGraph.
@@ -81,6 +102,7 @@ per-base arrays and the GenMap bedGraph.
 | `assess_runs.tsv` | Per grid run: callable bp, SNPs, median \|ρ\| of each statistic with depth, depth imbalance and callable fraction, artefact score, recommendation |
 | `assess_stats.tsv` | The same per statistic column (each pool, each pair) |
 | `OUT/params.sh` | Settings and masks for the full grenedalf run |
+| `OUT/optimiser_report.html` | The report |
 
 Downstream, drop windows with fewer than `MIN_SNPS` passed SNPs. Note that
 `grenedalf frequency` applies no sample filters, so a script reading the frequency
@@ -98,6 +120,8 @@ These depend on grenedalf behaviour that could not be tested here (written again
   says *WRONG WAY ROUND*, grenedalf treats the BED as the regions to keep.
 - The per-sample mask list is written as `sample<TAB>bed`. Check this against
   `grenedalf diversity --help` before using the `per_sample_masks` grid run.
+- Per-pool `--pool-sizes` files (when pools differ, and for the X and mito runs) are written as
+  `sample<TAB>size`. Check this format against `grenedalf --help`.
 - Pool names are taken from the BAM file names without the extension, as grenedalf
   names samples. They must match the column prefixes in grenedalf's tables.
 
@@ -112,6 +136,33 @@ These depend on grenedalf behaviour that could not be tested here (written again
 - The linkage scale assumes the pools differ in frequency at least somewhat. With
   near-identical pools there is no excess r² to measure, and the window width falls back
   to SNP density alone.
+
+## Report
+
+`OUT/optimiser_report.html` is a single self-contained file (inline SVG; no external
+scripts, fonts or network access), so it can be copied off the cluster and opened in
+any browser. It follows the light/dark setting, with a toggle. Sections:
+
+- **Recommended settings**: headline numbers and the `params.sh` to use
+- **Accessibility mask**: fraction of each chromosome masked, by reason, and the
+  single-pool depth anomalies that were left in
+- **Depth per pool**: each pool's depth curve with its kept range, and how much of the
+  accessible genome each pool's bounds (and the shared mask) cost
+- **Minimum allele count**: expected error-only sites per Mb at each count
+- **Linkage scale**: r² against distance, with the baseline and decay distances
+- **Window size**: windows reaching the SNP target by width, the linkage scale, and
+  the mask orientation check
+- **Filter grid**: data kept and artefact score for every run, and the median |ρ| of
+  each statistic with each technical covariate
+
+Hovering over any mark shows its values. Tables sit under each chart. An example built
+from the synthetic test data is in [`docs/example_report.html`](docs/example_report.html).
+To rebuild the report on its own:
+
+```bash
+bin/grenedalf_optimiser.sh my_config.sh report
+# or: python3 bin/grenedalf_optimiser.py report --prefix OUT/optimiser --out report.html
+```
 
 ## Test
 

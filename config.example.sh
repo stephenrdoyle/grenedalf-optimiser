@@ -11,9 +11,11 @@ OUT=grenedalf_optimiser_out
 THREADS=8
 
 POOL_SIZE=400                         # haploid genomes per pool (200 diploid L3)
+POOL_SIZES=                           # or per pool, if they differ: ARA_L3=400,BET_L3=380,...
 CHROM_REGEX='hcontortus_chr[1-5X]_'   # analysed chromosomes; mitochondrion and the rest are masked
 X_REGEX='chrX'
-PILOT_REGION=hcontortus_chr1_Celeg_TT_arrow_pilon   # grenedalf --filter-region for the pilot and grid runs
+MITO_REGEX='mitochondrion'            # mitochondrial contig(s): analysed in their own run
+REGION=                               # empty = whole genome (recommended); one chromosome for a quick trial
 
 # Read filters (kept fixed; reported, not tuned)
 MAPQ=30

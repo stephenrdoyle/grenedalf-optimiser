@@ -28,15 +28,20 @@ Subcommands (run in this order; grenedalf_optimiser.sh runs the external tools b
               width at which most windows hold enough SNPs for a precise estimate) and,
               with --ld, no narrower than the linkage scale from the ld step.
               Also checks that grenedalf applied the mask the right way round.
+  chromclass  do the X and mitochondrion behave like autosomes (depth ratio, bootstrap
+              interval)? If not, they get their own grenedalf runs and pool sizes.
   ld          linkage scale: how fast the correlation of allele frequencies across
               pools decays with distance between SNPs (an LD decay for pool-seq).
   assess      compares grenedalf runs over a grid of settings on technical criteria
               only, and names the most permissive setting that adds no artefact.
+  commands    grenedalf_commands.sh: ready-to-run commands with the chosen settings.
+  report      one HTML file with every step's results (self-contained, opens offline).
 """
 
 import argparse
 import gzip
 import math
+import os
 import re
 import sys
 
@@ -151,6 +156,20 @@ def normalise_by_chrom(df, col):
     """Depth relative to the median of the chromosome's covered bins."""
     med = df[col].where(df[col] > 0).groupby(df["chrom"]).transform("median")
     return df[col] / med
+
+
+def parse_pool_sizes(spec, names):
+    """Pool size (haploid genomes) per pool, from "400" or "POOL=400,POOL2=380"."""
+    if spec is None or str(spec).strip() == "":
+        return {}
+    spec = str(spec).strip()
+    if "=" not in spec:
+        return {n: float(spec) for n in names}
+    sizes = dict((k.strip(), float(v)) for k, v in (x.split("=", 1) for x in spec.split(",") if x.strip()))
+    missing = [n for n in names if n not in sizes]
+    if missing:
+        sys.exit(f"no pool size for {', '.join(missing)} in '{spec}'")
+    return sizes
 
 
 def write_params(path, params):
@@ -450,6 +469,22 @@ def cmd_thresholds(args):
         mc_rows.append(row)
     mc = pd.DataFrame(mc_rows)
 
+    # With the pool size: how many chromosomes each pool effectively samples at its depth
+    # (reads are a sample of a sample), and the lowest allele frequency the minimum count
+    # can see, against the frequency of a single copy in the pool.
+    sizes = parse_pool_sizes(args.pool_sizes, list(mc["pool"]))
+    if sizes:
+        global_mc = int(mc["min_count"].max())
+        n = mc["pool"].map(sizes)
+        d = mc["median_depth"].astype(float)
+        mc["pool_size"] = n
+        mc["n_eff"] = (d * n / (d + n - 1)).round(1)
+        mc["min_detectable_freq"] = (global_mc / d).round(4)
+        mc["single_copy_freq"] = (1 / n).round(4)
+        thr["pool_size"] = thr["pool"].map(sizes)
+        thr["n_eff_at_upper"] = (thr["upper"] * thr["pool_size"] / (thr["upper"] + thr["pool_size"] - 1)).round(1)
+        thr["n_eff_at_median"] = (thr["median"] * thr["pool_size"] / (thr["median"] + thr["pool_size"] - 1)).round(1)
+
     thr.to_csv(f"{args.out}.depth_thresholds.tsv", sep="\t", index=False)
     mc.to_csv(f"{args.out}.min_count.tsv", sep="\t", index=False)
     pd.DataFrame(quantize).to_csv(f"{args.out}.quantize.tsv", sep="\t", index=False, header=False)
@@ -624,6 +659,195 @@ def cmd_windows(args):
     with open(f"{args.out}.windows.txt", "w") as fh:
         fh.write("\n".join(lines) + "\n")
     print("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# chromclass
+
+def block_bootstrap_ratio(x, a, n_boot, block, rng):
+    """95% interval of median(x) / median(a), resampling blocks of adjacent bins."""
+    def blocks(v):
+        k = max(len(v) // block, 1)
+        return [v[i * block:(i + 1) * block] for i in range(k)] if len(v) >= block else [v]
+    bx, ba = blocks(x), blocks(a)
+    out = np.empty(n_boot)
+    for i in range(n_boot):
+        sx = np.concatenate([bx[j] for j in rng.integers(0, len(bx), len(bx))])
+        sa = np.concatenate([ba[j] for j in rng.integers(0, len(ba), len(ba))])
+        out[i] = np.median(sx) / np.median(sa)
+    return np.percentile(out, [2.5, 97.5])
+
+
+def cmd_chromclass(args):
+    """Do the X and the mitochondrion behave like autosomes? Depth ratios to autosomes per pool.
+
+    X: in a pool with males (hemizygous), X depth is below autosome depth, and the X is
+    sampled from fewer copies, so grenedalf needs a smaller X pool size: with a fraction m
+    of males, X depth / autosome depth = 1 - m/2, and the X pool size is pool_size * (1 - m/2).
+    If any pool's ratio differs from 1 (95% interval excludes it, by more than
+    --min-difference), the X is run separately with its own pool sizes.
+    Mitochondrion: haploid, many copies per cell, one lineage per individual: always run
+    separately, with its own depth bounds and a pool size of the number of individuals."""
+    xre, mre, keep = re.compile(args.x_regex), re.compile(args.mito_regex), re.compile(args.chrom_regex)
+    fai = read_fai(args.fai)
+    mask = merge_intervals(read_bed(args.mask_bed)) if args.mask_bed else None
+    sizes = parse_pool_sizes(args.pool_sizes, [n for n, _ in args.depth])
+    rng = np.random.default_rng(args.seed)
+
+    def chrom_class(c):
+        if mre.search(c):
+            return "M"
+        if not keep.search(c):
+            return None
+        return "X" if xre.search(c) else "A"
+
+    rows, mito_bounds = [], {}
+    for name, path in args.depth:
+        b = read_mosdepth_bins(path, "depth")
+        b["class"] = b["chrom"].map(chrom_class)
+        b = b[b["class"].notna()].copy()
+        if mask is not None:
+            # A and X: bins at least half accessible; the mitochondrion is in the mask as excluded
+            frac = np.zeros(len(b))
+            for chrom, idx in b.groupby("chrom").indices.items():
+                m = mask[mask["chrom"] == chrom]
+                if m.empty:
+                    continue
+                g = b.iloc[idx]
+                cs = coverage_prefix(m, int(g["end"].max()))
+                frac[idx] = (cs[g["end"].to_numpy()] - cs[g["start"].to_numpy()]) / (g["end"] - g["start"]).to_numpy()
+            b = b[(frac < 0.5) | (b["class"] == "M")]
+        a = b.loc[b["class"] == "A", "depth"].to_numpy()
+        if a.size == 0:
+            sys.exit(f"{name}: no autosomal bins")
+        med_a = float(np.median(a))
+        n = sizes.get(name, np.nan)
+        rows.append({"pool": name, "class": "A", "bins": a.size, "median_depth": med_a, "ratio_to_A": 1.0,
+                     "ci_low": 1.0, "ci_high": 1.0, "differs": False, "pool_size": n})
+        for cls in ("X", "M"):
+            x = b.loc[b["class"] == cls, "depth"].to_numpy()
+            if x.size == 0:
+                continue
+            ratio = float(np.median(x)) / med_a
+            lo, hi = block_bootstrap_ratio(x, a, args.bootstrap, args.block, rng)
+            differs = bool((hi < 1 or lo > 1) and abs(ratio - 1) > args.min_difference)
+            row = {"pool": name, "class": cls, "bins": x.size, "median_depth": float(np.median(x)),
+                   "ratio_to_A": round(ratio, 4), "ci_low": round(float(lo), 4), "ci_high": round(float(hi), 4),
+                   "differs": differs}
+            if cls == "X":
+                m = float(np.clip(2 * (1 - ratio), 0, 1))
+                row["male_fraction_est"] = round(m, 3)
+                row["pool_size"] = round(n * (1 - m / 2)) if np.isfinite(n) else np.nan
+            else:
+                row["pool_size"] = round(n / 2) if np.isfinite(n) else np.nan
+                mito_bounds[name] = depth_bounds(float(np.median(x)), args.min_fold, args.max_fold, args.abs_min_depth)
+            rows.append(row)
+
+    t = pd.DataFrame(rows)
+    t.to_csv(f"{args.out}.chrom_classes.tsv", sep="\t", index=False)
+    x = t[t["class"] == "X"]
+    m = t[t["class"] == "M"]
+    params = {"X_SEPARATE": int(bool(x["differs"].any())) if len(x) else 0,
+              "MITO_CHROMS": ",".join(c for c in fai["chrom"] if mre.search(c))}
+    if len(x) and x["pool_size"].notna().all():
+        with open(f"{args.out}.x_pool_sizes.tsv", "w") as fh:
+            for r in x.itertuples():
+                fh.write(f"{r.pool}\t{int(r.pool_size)}\n")
+        params["X_POOL_SIZES"] = f"{args.out}.x_pool_sizes.tsv"
+    if len(m):
+        params.update({"MITO_SEPARATE": 1, "MITO_MIN_DEPTH": min(v[0] for v in mito_bounds.values()),
+                       "MITO_MAX_DEPTH": max(v[1] for v in mito_bounds.values())})
+        if m["pool_size"].notna().all():
+            with open(f"{args.out}.mito_pool_sizes.tsv", "w") as fh:
+                for r in m.itertuples():
+                    fh.write(f"{r.pool}\t{int(r.pool_size)}\n")
+            params["MITO_POOL_SIZES"] = f"{args.out}.mito_pool_sizes.tsv"
+    else:
+        params["MITO_SEPARATE"] = 0
+    write_params(f"{args.out}.chromclass.params", params)
+    print(t.to_string(index=False))
+    if len(x):
+        print("\nX differs from autosomes in at least one pool: run it separately with its own pool sizes"
+              if params["X_SEPARATE"] else "\nX behaves like the autosomes in every pool: analyse together")
+
+
+# ---------------------------------------------------------------------------
+# commands
+
+def cmd_commands(args):
+    """Ready-to-run grenedalf commands with the chosen settings, one run per chromosome class."""
+    P = args.prefix
+    cc = {}
+    if os.path.exists(f"{P}.chromclass.params"):
+        with open(f"{P}.chromclass.params") as fh:
+            cc = dict(l.strip().split("=", 1) for l in fh if "=" in l)
+    fai = read_fai(args.fai)
+    xre = re.compile(args.x_regex)
+    mito = [c for c in cc.get("MITO_CHROMS", "").split(",") if c]
+    x_chroms = [c for c in fai["chrom"] if xre.search(c) and c not in mito]
+    x_sep = cc.get("X_SEPARATE", "0") == "1" and x_chroms
+    base = merge_intervals(read_bed(args.total_mask))
+    whole = lambda chroms: fai[fai["chrom"].isin(chroms)].assign(start=0).rename(columns={"length": "end"})[
+        ["chrom", "start", "end"]]
+
+    runs = []
+    if x_sep:
+        # Autosome run: X added to the mask. X run: everything but X added to the mask.
+        auto_mask = f"{P}.mask_autosomes.bed"
+        write_bed(merge_intervals(pd.concat([base, whole(x_chroms)])), auto_mask)
+        x_mask = f"{P}.mask_X.bed"
+        write_bed(merge_intervals(pd.concat([base, whole([c for c in fai["chrom"] if c not in x_chroms])])), x_mask)
+        runs.append(("autosomes", "autosomes (X masked; it gets its own pool sizes below)", auto_mask,
+                     args.pool_size_arg, args.min_depth, args.max_depth, args.sample_masks))
+        runs.append(("X", "X chromosome, with per-pool X pool sizes (fewer copies in pools with males)", x_mask,
+                     cc.get("X_POOL_SIZES", args.pool_size_arg), args.min_depth, args.max_depth, args.sample_masks))
+    else:
+        runs.append(("nuclear", "autosomes" + (" and X (X depth matches the autosomes)" if x_chroms else ""),
+                     args.total_mask, args.pool_size_arg, args.min_depth, args.max_depth, args.sample_masks))
+    if mito and cc.get("MITO_SEPARATE", "0") == "1":
+        m_mask = f"{P}.mask_mito.bed"
+        write_bed(whole([c for c in fai["chrom"] if c not in mito]), m_mask)
+        runs.append(("mito", "mitochondrion: haploid, pool size = individuals, its own depth bounds "
+                     "(whole genome as one window)", m_mask, cc.get("MITO_POOL_SIZES", args.pool_size_arg),
+                     cc.get("MITO_MIN_DEPTH", args.min_depth), cc.get("MITO_MAX_DEPTH", args.max_depth), ""))
+
+    L = ["#!/usr/bin/env bash",
+         f"# grenedalf commands recommended by grenedalf-optimiser ({pd.Timestamp.now():%Y-%m-%d}).",
+         "# Settings chosen on technical criteria only; see optimiser_report.html for why.",
+         "set -euo pipefail", "",
+         f"OUTDIR={args.grenedalf_out}", f"THREADS={args.threads}", ""]
+    for key, desc, mask_bed, pools, mind, maxd, smasks in runs:
+        mito_run = key == "mito"
+        L.append(f"# --- {desc}")
+        for cmd in ("diversity", "fst"):
+            c = [f"grenedalf {cmd}"]
+            c += [f"--sam-path {b}" for b in args.bam]
+            c += [f"--reference-genome-fai {args.fai}",
+                  f"--sam-min-map-qual {args.map_qual} --sam-min-base-qual {args.base_qual}",
+                  f"--filter-mask-total-bed {mask_bed}"]
+            if smasks:
+                c.append(f"--filter-mask-sample-bed-list {smasks}")
+            c += [f"--filter-sample-min-count {args.min_count}",
+                  f"--filter-sample-min-read-depth {mind} --filter-sample-max-read-depth {maxd}"]
+            if mito_run:
+                c.append("--window-type chromosomes")
+            else:
+                c.append(f"--window-type interval --window-interval-width {args.window} "
+                         f"--window-interval-stride {args.stride}")
+            c += ["--window-average-policy valid-loci", f"--pool-sizes {pools}"]
+            if cmd == "fst":
+                c.append(f"--method {args.fst_method}")
+            c += ["--separator-char tab --threads $THREADS",
+                  f"--out-dir $OUTDIR/{key} --file-prefix {key}_"]
+            L.append(" \\\n    ".join(c))
+            L.append("")
+    if args.min_snps:
+        L.append(f"# Downstream: drop windows with fewer than {args.min_snps} passed SNPs (total.passed).")
+    out = os.path.join(args.out_dir, "grenedalf_commands.sh")
+    with open(out, "w") as fh:
+        fh.write("\n".join(L) + "\n")
+    os.chmod(out, 0o755)
+    print(f"wrote {out} ({len(runs)} run(s): {', '.join(r[0] for r in runs)})")
 
 
 # ---------------------------------------------------------------------------
@@ -919,7 +1143,7 @@ def cmd_assess(args):
     print(f"\nreference (strictest) run: {strict}; tolerance {args.tolerance}")
     print(f"most permissive run that adds no technical artefact: {best}")
     with open(f"{args.out}.assess.params", "w") as fh:
-        fh.write(f"RECOMMENDED_RUN={best}\n")
+        fh.write(f"RECOMMENDED_RUN={best}\nTOLERANCE={args.tolerance}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -968,6 +1192,7 @@ def main():
     p.add_argument("--base-qual", type=int, default=30, help="grenedalf --sam-min-base-qual [30]")
     p.add_argument("--map-qual", type=int, default=30, help="grenedalf --sam-min-map-qual [30]")
     p.add_argument("--error-rate", type=float, help="per-base error rate [10^(-base-qual/10)]")
+    p.add_argument("--pool-sizes", help="haploid genomes per pool: one number, or POOL=N,POOL=N")
     p.add_argument("--site-alpha", type=float, default=1e-4,
                    help="accepted chance per site that errors alone pass the minimum count [1e-4]")
     p.add_argument("--out", required=True)
@@ -1000,6 +1225,48 @@ def main():
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_windows)
 
+    p = sub.add_parser("chromclass", help="test whether X and mitochondrion depth differ from autosomes")
+    p.add_argument("--depth", nargs=2, action="append", required=True, metavar=("POOL", "MQX_BINS"),
+                   help="mosdepth bins at the MAPQ cut-off; repeat per pool")
+    p.add_argument("--fai", required=True)
+    p.add_argument("--mask-bed", help="accessibility mask (bins mostly masked are ignored)")
+    p.add_argument("--chrom-regex", default=".", help="analysed nuclear chromosomes")
+    p.add_argument("--x-regex", default=r"chrX|_X_|^X$")
+    p.add_argument("--mito-regex", default=r"mitochondri|^chrM$|^MT$|mtDNA")
+    p.add_argument("--pool-sizes", help="haploid genomes per pool: one number, or POOL=N,POOL=N")
+    p.add_argument("--min-difference", type=float, default=0.05,
+                   help="smallest |ratio - 1| treated as a real difference [0.05]")
+    p.add_argument("--min-fold", type=float, default=0.5)
+    p.add_argument("--max-fold", type=float, default=2.0)
+    p.add_argument("--abs-min-depth", type=int, default=10)
+    p.add_argument("--bootstrap", type=int, default=500)
+    p.add_argument("--block", type=int, default=50, help="bins per bootstrap block [50]")
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_chromclass)
+
+    p = sub.add_parser("commands", help="write grenedalf_commands.sh with the chosen settings")
+    p.add_argument("--prefix", required=True)
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--fai", required=True)
+    p.add_argument("--bam", nargs="+", required=True)
+    p.add_argument("--x-regex", default=r"chrX|_X_|^X$")
+    p.add_argument("--total-mask", required=True)
+    p.add_argument("--sample-masks", default="")
+    p.add_argument("--pool-size-arg", required=True, help="value for grenedalf --pool-sizes (number or file)")
+    p.add_argument("--min-count", required=True)
+    p.add_argument("--min-depth", required=True)
+    p.add_argument("--max-depth", required=True)
+    p.add_argument("--window", required=True)
+    p.add_argument("--stride", required=True)
+    p.add_argument("--min-snps", default="")
+    p.add_argument("--map-qual", default=30)
+    p.add_argument("--base-qual", default=30)
+    p.add_argument("--fst-method", default="unbiased-nei")
+    p.add_argument("--threads", default=4)
+    p.add_argument("--grenedalf-out", default="grenedalf_out")
+    p.set_defaults(func=cmd_commands)
+
     p = sub.add_parser("ld", help="linkage scale from the decay of between-pool frequency correlation",
                        description=cmd_ld_doc, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--frequency", required=True, help="grenedalf frequency table (--write-sample-counts)")
@@ -1029,6 +1296,15 @@ def main():
                    help="artefact increase over the strict run still accepted [0.05]")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_assess)
+
+    p = sub.add_parser("report", help="HTML report of all step outputs")
+    p.add_argument("--prefix", required=True, help="output prefix of the other steps (e.g. OUT/optimiser)")
+    p.add_argument("--out-dir", help="OUT directory, for params.sh and profile/*.dist (default: prefix directory)")
+    p.add_argument("--dist", nargs=2, action="append", metavar=("POOL", "REGION_DIST"),
+                   help="mosdepth region.dist per pool (default: OUT/profile/*.mosdepth.region.dist.txt)")
+    p.add_argument("--title", help="report title")
+    p.add_argument("--out", required=True, help="HTML file to write")
+    p.set_defaults(func=lambda a: __import__("optimiser_report").build_report(a))
 
     args = ap.parse_args()
     if args.cmd == "assess" and any(len(r) < 2 for r in args.run):

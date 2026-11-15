@@ -20,13 +20,13 @@ OUT=$D/driver
 POOL_SIZE=400
 CHROM_REGEX=sim_
 X_REGEX=chrX
-PILOT_REGION=sim_chr1
+MITO_REGEX=mito
 TARGET_SNPS=20
 LD_MAX_DIST=50000
 CONF
 "$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" all
 for f in optimiser.mask.bed optimiser.depth_thresholds.tsv optimiser.total_mask.bed optimiser.ld.params optimiser.windows.params \
-         optimiser.assess_runs.tsv params.sh grid/per_sample_masks/mask.sample_masks.tsv; do
+         optimiser.assess_runs.tsv optimiser.chrom_classes.tsv params.sh grenedalf_commands.sh optimiser_report.html grid/per_sample_masks/mask.sample_masks.tsv; do
     [[ -s "$D/driver/$f" ]] || { echo "FAIL: missing $f" >&2; exit 1; }
 done
 echo "driver test passed ($D/driver)"
