@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Stand-in for GenMap: index does nothing, map copies the simulated bedGraph
+set -euo pipefail
+if [[ $1 == map ]]; then
+    while [[ $# -gt 0 ]]; do [[ $1 == -O ]] && out=$2; shift; done
+    cp "$SIM_DIR/genmap.bedgraph" "$out/ref.genmap.bedgraph"
+fi

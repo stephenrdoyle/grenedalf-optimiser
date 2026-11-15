@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Stand-in for grenedalf: --help lists the options the driver checks; commands copy the
+# simulated "clean" tables, or the simulated frequency table.
+set -euo pipefail
+cmd=$1; shift
+if [[ ${1:-} == --help ]]; then
+    echo "--filter-mask-total-bed --filter-mask-sample-bed-list --filter-region --filter-sample-min-count"
+    echo "--filter-sample-min-read-depth --filter-sample-max-read-depth --allow-file-overwriting"
+    exit 0
+fi
+while [[ $# -gt 0 ]]; do [[ $1 == --out-dir ]] && out=$2; shift; done
+case $cmd in
+    diversity) cp "$SIM_DIR/clean.diversity.csv" "$out/diversity.csv" ;;
+    fst) cp "$SIM_DIR/clean.fst.csv" "$out/fst.csv" ;;
+    frequency) gzip -c "$SIM_DIR/frequency.csv" > "$out/frequency.csv.gz" ;;
+esac

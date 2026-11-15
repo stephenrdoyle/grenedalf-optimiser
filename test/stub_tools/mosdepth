@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Stand-in for mosdepth: copies the simulated output for the BAM's pool (SIM_DIR).
+set -euo pipefail
+mapq=0 quant= by=
+while [[ $# -gt 2 ]]; do
+    case $1 in
+        --mapq) mapq=$2; shift 2 ;;
+        --quantize) quant=$2; shift 2 ;;
+        --by) by=$2; shift 2 ;;
+        -t) shift 2 ;;
+        *) shift ;;
+    esac
+done
+prefix=$1 bam=$2
+pool=$(basename "${bam%.*}")
+if [[ -n $quant ]]; then
+    cp "$SIM_DIR/$pool.quantized.bed.gz" "$prefix.quantized.bed.gz"
+elif [[ $by =~ ^[0-9]+$ ]]; then
+    cp "$SIM_DIR/$pool.mq$([[ $mapq == 0 ]] && echo 0 || echo 30).regions.bed.gz" "$prefix.regions.bed.gz"
+else
+    cp "$SIM_DIR/$pool.mosdepth.region.dist.txt" "$prefix.mosdepth.region.dist.txt"
+fi

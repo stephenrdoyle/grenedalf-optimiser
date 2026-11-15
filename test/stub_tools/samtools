@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Stand-in for samtools stats
+bam=${!#}
+cat "$SIM_DIR/$(basename "${bam%.*}").stats"
