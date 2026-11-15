@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# grenedalf_tune.sh CONFIG STEP
+# grenedalf_optimiser.sh CONFIG STEP
 #
 # Chooses grenedalf filter settings from the technical properties of pool-seq BAMs,
 # before any biological signal is looked at. See README.md.
@@ -27,7 +27,7 @@ fi
 CONFIG=$1
 STEP=$2
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-TUNE=(python3 "$HERE/grenedalf_tune.py")
+OPTIMISER=(python3 "$HERE/grenedalf_optimiser.py")
 
 # Defaults; the config overrides them
 THREADS=4
@@ -71,7 +71,7 @@ done
 
 mkdir -p "$OUT"/{mappability,depth,profile,quantize,pilot,grid}
 OUT=$(cd "$OUT" && pwd)
-P="$OUT/tune"
+P="$OUT/optimiser"
 
 log() { echo "[$(date '+%F %T')] $*" >&2; }
 
@@ -138,7 +138,7 @@ step_mask() {
     done
     local soft=()
     [[ "$SOFTMASK" == 1 ]] && soft=(--softmask)
-    "${TUNE[@]}" mask --fai "$FAI" --ref "$REF" ${soft[@]+"${soft[@]}"} --genmap "$bedgraph" --kmer "$KMER" \
+    "${OPTIMISER[@]}" mask --fai "$FAI" --ref "$REF" ${soft[@]+"${soft[@]}"} --genmap "$bedgraph" --kmer "$KMER" \
         --chrom-regex "$CHROM_REGEX" "${depth_args[@]}" --out "$P"
 }
 
@@ -157,7 +157,7 @@ step_thresholds() {
     for n in "${NAMES[@]}"; do
         a+=(--dist "$n" "$OUT/profile/$n.mosdepth.region.dist.txt" --stats "$n" "$OUT/profile/$n.stats")
     done
-    "${TUNE[@]}" thresholds "${a[@]}" --mask-summary "$P.mask_summary.tsv" --x-regex "$X_REGEX" \
+    "${OPTIMISER[@]}" thresholds "${a[@]}" --mask-summary "$P.mask_summary.tsv" --x-regex "$X_REGEX" \
         --min-fold "$MIN_FOLD" --max-fold "$MAX_FOLD" --abs-min-depth "$ABS_MIN_DEPTH" \
         --grid-min-folds "$GRID_MIN_FOLDS" --grid-max-folds "$GRID_MAX_FOLDS" \
         --base-qual "$BASEQ" --map-qual "$MAPQ" --out "$P"
@@ -176,7 +176,7 @@ step_quantize() {
 depthmask() {
     local a=()
     for n in "${NAMES[@]}"; do a+=(--quantized "$n" "$OUT/quantize/$n.quantized.bed.gz"); done
-    "${TUNE[@]}" depthmask "${a[@]}" --thresholds "$P.depth_thresholds.tsv" --chrom-class "$P.chrom_class.tsv" \
+    "${OPTIMISER[@]}" depthmask "${a[@]}" --thresholds "$P.depth_thresholds.tsv" --chrom-class "$P.chrom_class.tsv" \
         --fai "$FAI" --base-mask "$5" --min-fold "$2" --max-fold "$3" --mode "$4" --out "$1"
 }
 
@@ -202,10 +202,10 @@ step_pilot() {
             --out-dir "$OUT/pilot" --allow-file-overwriting > "$OUT/pilot/frequency.log" 2>&1
     fi
     # shellcheck disable=SC2086
-    "${TUNE[@]}" ld --frequency "$OUT/pilot/frequency.csv.gz" --region ${LD_REGION:-${PILOT_REGION%%:*}} \
+    "${OPTIMISER[@]}" ld --frequency "$OUT/pilot/frequency.csv.gz" --region ${LD_REGION:-${PILOT_REGION%%:*}} \
         --mask-bed "$TOTAL_MASK_BED" --min-count "$MIN_COUNT" --min-depth "$MIN_DEPTH" --max-depth "$MAX_DEPTH" \
         --max-dist "$LD_MAX_DIST" --out "$P"
-    "${TUNE[@]}" windows --table "$OUT/pilot/diversity.csv" --target-snps "$TARGET_SNPS" \
+    "${OPTIMISER[@]}" windows --table "$OUT/pilot/diversity.csv" --target-snps "$TARGET_SNPS" \
         --mask-bed "$TOTAL_MASK_BED" --ld "$P.ld.params" --out "$P"
 }
 
@@ -239,7 +239,7 @@ step_grid() {
         assess+=(--run "$r" "$g/$r/diversity.csv" "$g/$r/fst.csv")
     done
     for n in "${NAMES[@]}"; do assess+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz"); done
-    "${TUNE[@]}" assess "${assess[@]}" --min-snps "$MIN_SNPS" --tolerance "$TOLERANCE" --out "$P"
+    "${OPTIMISER[@]}" assess "${assess[@]}" --min-snps "$MIN_SNPS" --tolerance "$TOLERANCE" --out "$P"
 }
 
 step_params() {
@@ -250,7 +250,7 @@ step_params() {
     local mc=$MIN_COUNT
     [[ $r == min_count_* ]] && mc=${r#min_count_}
     cat > "$OUT/params.sh" <<EOF
-# grenedalf settings chosen by grenedalf_tune ($(date '+%F')), run: $r
+# grenedalf settings chosen by grenedalf_optimiser ($(date '+%F')), run: $r
 # Technical criteria only; see $P.assess_runs.tsv and the other $P.* tables.
 TOTAL_MASK_BED=$TOTAL_MASK_BED
 SAMPLE_MASK_LIST=$SAMPLE_MASK_LIST

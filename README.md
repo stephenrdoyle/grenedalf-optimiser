@@ -1,4 +1,4 @@
-# grenedalf-tune
+# grenedalf-optimiser
 
 Chooses grenedalf filter settings for pool-seq data from the technical properties of the
 BAMs, **before any biological signal is looked at**.
@@ -23,7 +23,7 @@ with the strictest setting tried.
 
 | Step | Tools | What it decides |
 |---|---|---|
-| `mask` | GenMap, mosdepth | **Accessibility mask**, the same for all pools: reference gaps; low mappability (most k-mers covering a base are not unique, so reads there get MAPQ 0 and the site looks "missing"); collapsed repeats (consensus depth > 2× the chromosome median: extra genomic copies stacked on one reference copy); ambiguous mapping (consensus: most reads below the MAPQ cut-off, which catches repeats GenMap cannot see because the reference lacks them); sequence absent from every pool. Optionally soft-masked repeats. Depth anomalies in **single** pools (deletions, CNVs) are written to `tune.pool_specific_depth.tsv` and **not masked**, because they may be biology. |
+| `mask` | GenMap, mosdepth | **Accessibility mask**, the same for all pools: reference gaps; low mappability (most k-mers covering a base are not unique, so reads there get MAPQ 0 and the site looks "missing"); collapsed repeats (consensus depth > 2× the chromosome median: extra genomic copies stacked on one reference copy); ambiguous mapping (consensus: most reads below the MAPQ cut-off, which catches repeats GenMap cannot see because the reference lacks them); sequence absent from every pool. Optionally soft-masked repeats. Depth anomalies in **single** pools (deletions, CNVs) are written to `optimiser.pool_specific_depth.tsv` and **not masked**, because they may be biology. |
 | `profile` | mosdepth, samtools | Each pool's depth distribution **inside the accessible genome only**, so repeats and gaps do not distort it. |
 | `thresholds` | – | **Per-pool depth bounds**, autosomes and X separately (the X runs at lower depth when males are in the pool): fold × that pool's median. A single 30–300 for every pool removes a different fraction of the genome from a 60× pool than from a 150× pool. **Minimum allele count**: the smallest count that sequencing errors alone rarely reach at the pool's depth, given the base-quality cut-off. |
 | `quantize`, `depthmask` | mosdepth | Applies the per-pool bounds as BED masks. grenedalf has only one global depth filter, so per-pool bounds have to go in as masks. `shared` mode (default) merges them, so every pool is called at exactly the same sites. `per-sample` keeps more sites at the cost of uneven missingness; the grid tests both. |
@@ -52,7 +52,7 @@ Requirements: python3 with numpy and pandas; mosdepth, samtools, GenMap and gren
 
 ```bash
 cp config.example.sh my_config.sh    # edit paths, pools, pilot chromosome
-bin/grenedalf_tune.sh my_config.sh all
+bin/grenedalf_optimiser.sh my_config.sh all
 ```
 
 Or run one step at a time (`mask profile thresholds quantize depthmask pilot grid params`).
@@ -60,13 +60,13 @@ Each step reads what the previous ones wrote in `OUT/`. On the farm, for example
 
 ```bash
 bsub -n 8 -R "span[hosts=1] select[mem>16000] rusage[mem=16000]" -M 16000 \
-    -o tune.%J.o -e tune.%J.e bin/grenedalf_tune.sh my_config.sh all
+    -o optimiser.%J.o -e optimiser.%J.e bin/grenedalf_optimiser.sh my_config.sh all
 ```
 
 The memory goes on GenMap indexing and on the mask step, which holds one chromosome as
 per-base arrays and the GenMap bedGraph.
 
-## Outputs (`OUT/tune.*`)
+## Outputs (`OUT/optimiser.*`)
 
 | File | Read it for |
 |---|---|

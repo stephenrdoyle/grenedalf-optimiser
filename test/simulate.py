@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Synthetic stand-ins for the external tools' outputs (GenMap, mosdepth, samtools stats,
-grenedalf), so grenedalf_tune.py can be tested without BAMs. Used by run_test.sh.
+grenedalf), so grenedalf_optimiser.py can be tested without BAMs. Used by run_test.sh.
 
   simulate.py base DIR       reference, GenMap bedGraph, mosdepth bins, samtools stats,
                              and per-base depth (kept for the later phases)
-  simulate.py dist DIR       mosdepth region.dist over DIR/tune.accessible.bed
-  simulate.py quantize DIR   mosdepth --quantize output at the cut points in DIR/tune.quantize.tsv
+  simulate.py dist DIR       mosdepth region.dist over DIR/optimiser.accessible.bed
+  simulate.py quantize DIR   mosdepth --quantize output at the cut points in DIR/optimiser.quantize.tsv
   simulate.py grenedalf DIR  grenedalf diversity and fst tables for two runs: "clean" (statistics
                              independent of depth) and "artefact" (theta pi rises with depth)
 
@@ -107,7 +107,7 @@ def load_depth(d):
 
 
 def accessible(d):
-    return pd.read_csv(f"{d}/tune.accessible.bed", sep="\t", header=None, names=["chrom", "start", "end"])
+    return pd.read_csv(f"{d}/optimiser.accessible.bed", sep="\t", header=None, names=["chrom", "start", "end"])
 
 
 def dist(d):
@@ -130,7 +130,7 @@ def dist(d):
 
 def quantize(d):
     depth = load_depth(d)
-    spec = dict(pd.read_csv(f"{d}/tune.quantize.tsv", sep="\t", header=None).itertuples(index=False))
+    spec = dict(pd.read_csv(f"{d}/optimiser.quantize.tsv", sep="\t", header=None).itertuples(index=False))
     for p in POOLS:
         cuts = [int(x) for x in spec[p].strip(":").split(":")]
         edges = np.array(cuts + [np.iinfo(np.int32).max])
@@ -147,7 +147,7 @@ def quantize(d):
 
 def grenedalf(d):
     depth = load_depth(d)
-    mask = pd.read_csv(f"{d}/tune.total_mask.bed", sep="\t", header=None, names=["chrom", "start", "end"])
+    mask = pd.read_csv(f"{d}/optimiser.total_mask.bed", sep="\t", header=None, names=["chrom", "start", "end"])
     width, stride = 5000, 2500
     pools = list(POOLS)
     for run in ("clean", "artefact"):

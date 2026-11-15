@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Runs bin/grenedalf_tune.sh end to end with stand-ins for the external tools
+# Runs bin/grenedalf_optimiser.sh end to end with stand-ins for the external tools
 # (test/stub_tools), on the synthetic data from run_test.sh. Tests the driver's
 # plumbing, not the tools.
 #   test/run_driver_test.sh [OUTDIR]
@@ -24,9 +24,9 @@ PILOT_REGION=sim_chr1
 TARGET_SNPS=20
 LD_MAX_DIST=50000
 CONF
-"$HERE/../bin/grenedalf_tune.sh" "$D/config.sh" all
-for f in tune.mask.bed tune.depth_thresholds.tsv tune.total_mask.bed tune.ld.params tune.windows.params \
-         tune.assess_runs.tsv params.sh grid/per_sample_masks/mask.sample_masks.tsv; do
+"$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" all
+for f in optimiser.mask.bed optimiser.depth_thresholds.tsv optimiser.total_mask.bed optimiser.ld.params optimiser.windows.params \
+         optimiser.assess_runs.tsv params.sh grid/per_sample_masks/mask.sample_masks.tsv; do
     [[ -s "$D/driver/$f" ]] || { echo "FAIL: missing $f" >&2; exit 1; }
 done
 echo "driver test passed ($D/driver)"

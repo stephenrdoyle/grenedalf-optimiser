@@ -1,4 +1,4 @@
-# grenedalf_tune config (sourced by bin/grenedalf_tune.sh). Copy and edit.
+# grenedalf_optimiser config (sourced by bin/grenedalf_optimiser.sh). Copy and edit.
 # Example values: H. contortus eprinomectin pools, WBPS18 reference.
 
 REF_DIR=/nfs/users/nfs_s/sd21/lustre_link/haemonchus_contortus/project_eprinomectin-resistance/01_references
@@ -7,7 +7,7 @@ FAI=$REF.fai
 BAM_DIR=/path/to/bams
 BAMS=("$BAM_DIR"/ARA_L3.bam "$BAM_DIR"/BET_L3.bam "$BAM_DIR"/BUN_L3.bam
       "$BAM_DIR"/CHI_L3.bam "$BAM_DIR"/LUC_L3.bam "$BAM_DIR"/MOU_L3.bam)
-OUT=grenedalf_tune_out
+OUT=grenedalf_optimiser_out
 THREADS=8
 
 POOL_SIZE=400                         # haploid genomes per pool (200 diploid L3)

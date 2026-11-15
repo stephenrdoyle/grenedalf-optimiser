@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-grenedalf_tune: choose grenedalf filter settings from the technical properties of
+grenedalf_optimiser: choose grenedalf filter settings from the technical properties of
 the pool-seq BAMs, before any biological signal is looked at.
 
 Nothing here uses population labels, phenotypes, or the location of peaks. The
@@ -10,7 +10,7 @@ statistics (theta pi, Watterson's theta, Tajima's D, FST) depend on read depth o
 how much of a window could be called. A filter is loosened only as far as it can be
 without adding such a dependence, so as little data as possible is thrown away.
 
-Subcommands (run in this order; grenedalf_tune.sh runs the external tools between them):
+Subcommands (run in this order; grenedalf_optimiser.sh runs the external tools between them):
 
   mask        accessibility mask shared by all pools: reference gaps, low mappability
               (GenMap), optionally soft-masked repeats, and regions whose depth is
