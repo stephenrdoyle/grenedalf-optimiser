@@ -1,5 +1,10 @@
 # grenedalf-optimiser config: H. contortus eprinomectin L3 pools (WBPS18 reference), Sanger farm.
-# Set BAM_DIR, then:  bin/grenedalf_optimiser.sh examples/hcontortus_eprinomectin.config.sh check
+# Set BAM_DIR, then (setup once):
+#   bin/grenedalf_optimiser.sh CONFIG setup
+#   bin/grenedalf_optimiser.sh CONFIG check
+#   examples/submit_lsf.sh CONFIG
+
+CONDA_ENV=grenedalf-optimiser         # created by the setup step; activated by every step
 
 PROJECT=/nfs/users/nfs_s/sd21/lustre_link/haemonchus_contortus/project_eprinomectin-resistance
 REF=$PROJECT/01_references/haemonchus_contortus.PRJEB506.WBPS18.genomic.fa

@@ -53,9 +53,12 @@ Requirements: python3 with numpy and pandas; mosdepth, samtools, GenMap and gren
 (0.6.3); bash. All of them are in the conda environment in `environment.yml` (Linux):
 
 ```bash
-conda env create -f environment.yml      # or: mamba env create -f environment.yml
-conda activate grenedalf-optimiser
+bin/grenedalf_optimiser.sh my_config.sh setup     # creates (or updates) the environment; once
 ```
+
+Every step then activates the environment itself (`CONDA_ENV` in the config: a name or a
+path; `none` uses whatever is on PATH, e.g. modules), so no `conda activate` is needed,
+interactively or in a cluster job.
 
 ```bash
 cp config.example.sh my_config.sh    # edit paths, pools, pool sizes
@@ -72,7 +75,7 @@ regexes pick up as autosomes, X and mitochondrion.
 bin/grenedalf_optimiser.sh my_config.sh check
 ```
 
-Or run one step at a time (`check mask profile thresholds chromclass quantize depthmask pilot grid params report`).
+Or run one step at a time (`setup check mask profile thresholds chromclass quantize depthmask pilot grid params report`).
 Each step reads what the previous ones wrote in `OUT/`. On the farm, for example:
 
 ```bash
@@ -100,12 +103,12 @@ density and the linkage scale), the X / mitochondrion decision, or the read filt
 (MAPQ, base quality).
 
 On the Sanger farm, `examples/submit_lsf.sh` submits the whole run as one job on the
-long queue, activating the `grenedalf-optimiser` conda environment (or loading modules if it does not exist). `examples/hcontortus_eprinomectin.config.sh` is a filled-in config for the
+long queue. `examples/hcontortus_eprinomectin.config.sh` is a filled-in config for the
 eprinomectin pools (set `BAM_DIR`):
 
 ```bash
 git clone https://github.com/stephenrdoyle/grenedalf-optimiser.git && cd grenedalf-optimiser
-conda env create -f environment.yml && conda activate grenedalf-optimiser
+bin/grenedalf_optimiser.sh examples/hcontortus_eprinomectin.config.sh setup
 bin/grenedalf_optimiser.sh examples/hcontortus_eprinomectin.config.sh check
 examples/submit_lsf.sh examples/hcontortus_eprinomectin.config.sh
 ```

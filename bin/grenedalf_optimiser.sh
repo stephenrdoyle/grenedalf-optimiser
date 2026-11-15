@@ -5,6 +5,7 @@
 # before any biological signal is looked at. See README.md.
 #
 # Steps (run in order, or "all"):
+#   setup      create (or update) the conda environment from environment.yml; run once
 #   check      preflight: tools, python packages, grenedalf options, BAMs, indexes, contig names
 #   mask       GenMap mappability + mosdepth depth bins -> accessibility mask
 #   profile    per-pool depth distribution in the accessible genome, samtools stats
@@ -19,13 +20,15 @@
 # pilot and grid use the whole genome unless REGION is set (e.g. one chromosome for a quick trial).
 #   report     OUT/optimiser_report.html: every step's results in one self-contained page
 #
-# Needs on PATH (or set in the config): python3 with numpy and pandas, mosdepth,
+# Every step activates the conda environment CONDA_ENV (default grenedalf-optimiser; a
+# name or a path) when it exists, so no "conda activate" is needed. CONDA_ENV=none uses
+# whatever is already on PATH (e.g. modules): python3 with numpy and pandas, mosdepth,
 # samtools, genmap (unless MAPPABILITY_BEDGRAPH is given) and grenedalf.
 
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
 fi
 
@@ -35,6 +38,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OPTIMISER=(python3 "$HERE/grenedalf_optimiser.py")
 
 # Defaults; the config overrides them
+CONDA_ENV=grenedalf-optimiser
 THREADS=4
 KMER=150
 GENMAP_ERRORS=2
@@ -79,6 +83,74 @@ for bam in "${BAMS[@]}"; do
     NAMES+=("${n%.*}")
 done
 
+log() { echo "[$(date '+%F %T')] $*" >&2; }
+
+# conda: find it even in a non-interactive shell (LSF job), then activate CONDA_ENV
+conda_init() {
+    local base=""
+    if command -v conda > /dev/null; then
+        base=$(conda info --base 2> /dev/null)
+    elif [[ -n "${CONDA_EXE:-}" ]]; then
+        base=$(dirname "$(dirname "$CONDA_EXE")")
+    else
+        for d in "$HOME/miniforge3" "$HOME/mambaforge" "$HOME/miniconda3" "$HOME/anaconda3"; do
+            [[ -x "$d/bin/conda" ]] && { base=$d; break; }
+        done
+    fi
+    [[ -n "$base" && -f "$base/etc/profile.d/conda.sh" ]] || return 1
+    set +u
+    # shellcheck source=/dev/null
+    source "$base/etc/profile.d/conda.sh"
+    [[ -f "$base/etc/profile.d/mamba.sh" ]] && source "$base/etc/profile.d/mamba.sh"
+    set -u
+}
+
+conda_env_exists() {
+    [[ -d "$CONDA_ENV" ]] || conda env list | awk '$1 !~ /^#/ {print $1; print $NF}' | grep -qx -- "$CONDA_ENV"
+}
+
+activate_env() {
+    [[ "$CONDA_ENV" == none || "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" || "${CONDA_PREFIX:-}" == "$CONDA_ENV" ]] && return 0
+    if ! conda_init; then
+        log "conda not found; using tools on PATH (set CONDA_ENV=none to silence this)"
+        return 0
+    fi
+    if conda_env_exists; then
+        set +u
+        conda activate "$CONDA_ENV"
+        set -u
+        log "conda environment: $CONDA_ENV"
+    else
+        log "conda environment $CONDA_ENV not found (create it with the setup step); using tools on PATH"
+    fi
+}
+
+step_setup() {
+    local yml="$HERE/../environment.yml" tool=conda
+    conda_init || { echo "conda not found: install miniforge, or load the farm's conda module" >&2; exit 1; }
+    command -v mamba > /dev/null && tool=mamba
+    local where=(-n "$CONDA_ENV")
+    [[ "$CONDA_ENV" == */* ]] && where=(-p "$CONDA_ENV")
+    if conda_env_exists; then
+        log "updating $CONDA_ENV from $yml"
+        "$tool" env update "${where[@]}" -f "$yml" --prune
+    else
+        log "creating $CONDA_ENV from $yml"
+        "$tool" env create "${where[@]}" -f "$yml"
+    fi
+    activate_env
+    local t
+    for t in grenedalf mosdepth samtools genmap python3; do
+        log "  $t: $(command -v "$t" || echo MISSING)"
+    done
+}
+
+if [[ "$STEP" == setup ]]; then
+    step_setup
+    exit 0
+fi
+activate_env
+
 mkdir -p "$OUT"/{mappability,depth,profile,quantize,pilot,grid}
 OUT=$(cd "$OUT" && pwd)
 P="$OUT/optimiser"
@@ -93,8 +165,6 @@ else
     POOL_SPEC=$POOL_SIZE
     POOL_SIZE_ARG=$POOL_SIZE
 fi
-
-log() { echo "[$(date '+%F %T')] $*" >&2; }
 
 load_params() {
     for f in "$P".mask.params "$P".thresholds.params "$P".chromclass.params "$P".depthmask.params \
@@ -139,9 +209,9 @@ step_check() {
     bad() { echo "  PROBLEM: $*"; problems=$((problems + 1)); }
     ok() { echo "  ok: $*"; }
 
-    echo "tools"
+    echo "tools (conda environment: ${CONDA_DEFAULT_ENV:-none active})"
     for t in "$MOSDEPTH" "$SAMTOOLS" "$GRENEDALF" python3; do
-        if command -v "$t" > /dev/null; then ok "$t ($(command -v "$t"))"; else bad "$t not on PATH"; fi
+        if command -v "$t" > /dev/null; then ok "$t ($(command -v "$t"))"; else bad "$t not on PATH (run the setup step, or set CONDA_ENV)"; fi
     done
     if [[ -z "$MAPPABILITY_BEDGRAPH" ]]; then
         if command -v "$GENMAP" > /dev/null; then ok "$GENMAP"; else bad "$GENMAP not on PATH (or set MAPPABILITY_BEDGRAPH)"; fi

@@ -44,7 +44,10 @@ LD_MAX_DIST=100000
 FST_METHOD=unbiased-nei
 TOLERANCE=0.05       # artefact increase over the strictest run still accepted
 
-# Tools (farm modules or containers)
+# Tools: the conda environment from environment.yml (bin/grenedalf_optimiser.sh CONFIG setup)
+# is activated by every step. CONDA_ENV=none uses whatever is on PATH, e.g. farm modules.
+CONDA_ENV=grenedalf-optimiser
+# Commands, if not the ones in the environment
 GRENEDALF=grenedalf
 MOSDEPTH=mosdepth
 SAMTOOLS=samtools
