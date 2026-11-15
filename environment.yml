@@ -1,0 +1,17 @@
+# conda environment with everything grenedalf-optimiser needs (Linux; GenMap has no macOS build).
+#   conda env create -f environment.yml      (or: mamba env create -f environment.yml)
+#   conda activate grenedalf-optimiser
+name: grenedalf-optimiser
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - python=3.11
+  - numpy>=1.24
+  - pandas>=2.0
+  - grenedalf=0.6.3     # pinned: the version the options and output columns were written against
+  - mosdepth>=0.3.3     # --quantize and region.dist
+  - samtools>=1.17
+  - genmap=1.3.0
+  - bash>=4

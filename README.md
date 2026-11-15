@@ -50,7 +50,12 @@ gives the effective number of independent tests downstream.
 ## Running
 
 Requirements: python3 with numpy and pandas; mosdepth, samtools, GenMap and grenedalf
-(≥ 0.6) on `PATH` or set in the config; bash (3.2 or later).
+(0.6.3); bash. All of them are in the conda environment in `environment.yml` (Linux):
+
+```bash
+conda env create -f environment.yml      # or: mamba env create -f environment.yml
+conda activate grenedalf-optimiser
+```
 
 ```bash
 cp config.example.sh my_config.sh    # edit paths, pools, pool sizes
@@ -95,11 +100,12 @@ density and the linkage scale), the X / mitochondrion decision, or the read filt
 (MAPQ, base quality).
 
 On the Sanger farm, `examples/submit_lsf.sh` submits the whole run as one job on the
-long queue. `examples/hcontortus_eprinomectin.config.sh` is a filled-in config for the
+long queue, activating the `grenedalf-optimiser` conda environment (or loading modules if it does not exist). `examples/hcontortus_eprinomectin.config.sh` is a filled-in config for the
 eprinomectin pools (set `BAM_DIR`):
 
 ```bash
 git clone https://github.com/stephenrdoyle/grenedalf-optimiser.git && cd grenedalf-optimiser
+conda env create -f environment.yml && conda activate grenedalf-optimiser
 bin/grenedalf_optimiser.sh examples/hcontortus_eprinomectin.config.sh check
 examples/submit_lsf.sh examples/hcontortus_eprinomectin.config.sh
 ```
