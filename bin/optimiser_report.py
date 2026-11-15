@@ -974,6 +974,12 @@ def section_grid(P):
     heat.columns = ["run"] + [c.replace(".rho_", " vs ").replace("_", " ") for c in cov_cols]
     tbl_cols = ["run", "callable_bp", "snps", "windows_scored", "artefact", "worst", "artefact_vs_strict",
                 "acceptable", "recommended"]
+    failed_html = ""
+    failed_path = os.path.join(os.path.dirname(P), "grid", "failed_runs.tsv")
+    if os.path.exists(failed_path) and os.path.getsize(failed_path):
+        fr = pd.read_csv(failed_path, sep="\t", header=None, names=["run", "error"])
+        failed_html = ('<p class="status">' + ICON_BAD + f"{len(fr)} grid run(s) failed and are left out of the "
+                       "comparison</p>" + plain_table(fr))
     rec = runs.loc[runs["recommended"].astype(str) == "True", "run"]
     rec = rec.iloc[0] if len(rec) else None
     detail = ""
@@ -986,7 +992,7 @@ def section_grid(P):
             "two pools of a pair, and the callable fraction of the window; none of these should matter. The artefact "
             "score is the worst median |ρ|. Runs no worse than the strictest run (within the tolerance) are accepted, "
             "and the one keeping the most data is recommended.</p>"
-            + legend + charts
+            + failed_html + legend + charts
             + "<h3>Median |ρ| with each technical covariate</h3>"
             + heat_table(heat, list(heat.columns[1:]), lambda v: f"{v:.2f}", vmax=max(float(np.nanmax(heat.iloc[:, 1:].to_numpy(dtype=float))), 0.1),
                          pick_row=lambda r: r["run"] == rec)

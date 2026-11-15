@@ -30,6 +30,10 @@ for f in optimiser.mask.bed optimiser.depth_thresholds.tsv optimiser.total_mask.
          optimiser.assess_runs.tsv optimiser.chrom_classes.tsv params.sh grenedalf_commands.sh optimiser_report.html grid/per_sample_masks/mask.sample_masks.tsv; do
     [[ -s "$D/driver/$f" ]] || { echo "FAIL: missing $f" >&2; exit 1; }
 done
+# grenedalf's mask rule: per-sample runs must not fail, and no grid run may fail
+[[ ! -s "$D/driver/grid/failed_runs.tsv" ]] || { echo "FAIL: grid runs failed: $(cat "$D/driver/grid/failed_runs.tsv")" >&2; exit 1; }
+grep -q "^per_sample_masks" "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: per_sample_masks run missing" >&2; exit 1; }
+
 # Cache: a second run with nothing changed reuses every slow result
 "$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" all > "$D/rerun.log" 2>&1
 n_reused=$(grep -c "reusing" "$D/rerun.log" || true)

@@ -11,16 +11,29 @@ if [[ ${1:-} == --help ]]; then
     echo "--pool-sizes  Pool sizes: a single number, or a file with sample name and size"
     exit 0
 fi
-mc="" no_tajima=0 out=""
+mc="" no_tajima=0 out="" total="" samples=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --out-dir) out=$2 ;;
+        --filter-mask-total-bed) total=$2 ;;
+        --filter-mask-samples-bed-list) samples=$2 ;;
         --filter-sample-min-count) mc=$2 ;;
         --no-tajima-d) no_tajima=1 ;;
         --filter-mask-sample-bed-list) echo "unknown option $1" >&2; exit 1 ;;
     esac
     shift
 done
+# Like grenedalf: total and per-sample masks must give the same chromosomes and lengths,
+# where a mask's chromosome length is its last masked position
+mask_dict() { awk -F'\t' '{if ($3 > m[$1]) m[$1] = $3} END {for (c in m) print c "\t" m[c]}' "$1" | sort; }
+if [[ -n $total && -n $samples ]]; then
+    while IFS=$'\t' read -r name bed; do
+        if [[ "$(mask_dict "$total")" != "$(mask_dict "$bed")" ]]; then
+            echo "Error: Provided total mask file and sample mask for sample $name do not contain the exact same chromosomes or lengths of chromosomes." >&2
+            exit 1
+        fi
+    done < "$samples"
+fi
 if [[ $cmd == diversity && $no_tajima == 0 && $mc != 2 ]]; then
     echo "--filter-sample-min-count: Tajima's D requires the minimum allele count to be exactly 2" >&2
     exit 1

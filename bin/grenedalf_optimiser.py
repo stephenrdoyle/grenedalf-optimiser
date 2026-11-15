@@ -91,6 +91,15 @@ def write_bed(df, path):
     df.to_csv(path, sep="\t", header=False, index=False)
 
 
+def write_mask(df, path, fai):
+    """Write a mask BED for grenedalf. grenedalf takes a mask's chromosome lengths from its
+    last masked position per chromosome, and requires the total mask and every per-sample
+    mask to agree exactly. So every mask also masks the last base of every reference
+    chromosome: all masks then describe the same chromosomes, at the cost of one base each."""
+    ends = pd.DataFrame({"chrom": fai["chrom"], "start": fai["length"] - 1, "end": fai["length"]})
+    write_bed(merge_intervals(pd.concat([df[["chrom", "start", "end"]], ends], ignore_index=True)), path)
+
+
 def iter_fasta(path):
     """Yield (name, sequence as bytes) for each record."""
     name, chunks = None, []
@@ -637,16 +646,16 @@ def cmd_depthmask(args):
               "MIN_DEPTH": min(lowers), "MAX_DEPTH": max(uppers)}
     if args.mode == "shared":
         total = merge_intervals(pd.concat([base] + list(per_pool.values()), ignore_index=True))
-        write_bed(total, f"{args.out}.total_mask.bed")
+        write_mask(total, f"{args.out}.total_mask.bed", fai)
         shared = genome_bp - bp(total[total["chrom"].isin(classes)])
         rows.append({"pool": "shared", "accessible_bp": accessible_bp, "out_of_range_bp": accessible_bp - shared,
                      "out_of_range_frac": round(1 - shared / accessible_bp, 4) if accessible_bp else np.nan})
         params.update({"TOTAL_MASK_BED": f"{args.out}.total_mask.bed", "SAMPLE_MASK_LIST": ""})
     else:
-        write_bed(base, f"{args.out}.total_mask.bed")
+        write_mask(base, f"{args.out}.total_mask.bed", fai)
         with open(f"{args.out}.sample_masks.tsv", "w") as fh:
             for name, out in per_pool.items():
-                write_bed(out, f"{args.out}.{name}.depth_mask.bed")
+                write_mask(out, f"{args.out}.{name}.depth_mask.bed", fai)
                 fh.write(f"{name}\t{args.out}.{name}.depth_mask.bed\n")
         params.update({"TOTAL_MASK_BED": f"{args.out}.total_mask.bed",
                        "SAMPLE_MASK_LIST": f"{args.out}.sample_masks.tsv"})
@@ -835,16 +844,20 @@ def cmd_windows(args):
             cs = coverage_prefix(m, int(g["end"].max()))
             exp_total += int((cs[g["end"].to_numpy()] - cs[g["start"].to_numpy() - 1]).sum())
         win_total = int(t["width"].sum())
+        inverted = win_total - exp_total
+        diff = abs(obs_total - exp_total) / max(exp_total, 1)
         if exp_total == 0:
             verdict = "mask has no overlap with these windows"
-        elif abs(obs_total - exp_total) <= 0.02 * exp_total:
-            verdict = "OK: grenedalf masked the BED intervals"
-        elif abs(obs_total - (win_total - exp_total)) <= 0.02 * (win_total - exp_total):
-            verdict = "WRONG WAY ROUND: grenedalf masked everything except the BED (check --filter-mask-total-invert)"
         elif obs_total == 0:
             verdict = "NOT APPLIED: total.masked is 0"
+        elif diff <= 0.05:
+            verdict = (f"OK: grenedalf masked the BED intervals (within {100 * diff:.1f}%; small differences come "
+                       "from how grenedalf counts masked positions at window and chromosome edges)")
+        elif abs(obs_total - inverted) < abs(obs_total - exp_total):
+            verdict = "WRONG WAY ROUND: grenedalf masked everything except the BED (check --filter-mask-total-bed-invert)"
         else:
-            verdict = "MISMATCH: compare total.masked with the BED by hand"
+            verdict = (f"MISMATCH: orientation is right but the counts differ by {100 * diff:.1f}%; "
+                       "compare total.masked with the BED by hand")
         lines.append(f"mask check: expected {exp_total:,} masked bp, grenedalf reported {obs_total:,} -> {verdict}")
 
     write_params(f"{args.out}.windows.params", {"WINDOW": rec, "STRIDE": rec // 2, "MIN_SNPS": args.target_snps,
@@ -1037,7 +1050,7 @@ def cmd_chromclass(args):
         with open(f"{args.out}.mito_sample_masks.tsv", "w") as fh:
             for name, m in mito_masks.items():
                 path = f"{args.out}.mito_mask.{name}.bed"
-                write_bed(m, path)
+                write_mask(m, path, fai)
                 fh.write(f"{name}\t{path}\n")
         params.update({"MITO_SEPARATE": 1, "MITO_SAMPLE_MASKS": f"{args.out}.mito_sample_masks.tsv",
                        # grenedalf's global bounds only as a backstop: the per-pool masks apply each pool's range
@@ -1082,9 +1095,9 @@ def cmd_commands(args):
     if x_sep:
         # Autosome run: X added to the mask. X run: everything but X added to the mask.
         auto_mask = f"{P}.mask_autosomes.bed"
-        write_bed(merge_intervals(pd.concat([base, whole(x_chroms)])), auto_mask)
+        write_mask(pd.concat([base, whole(x_chroms)]), auto_mask, fai)
         x_mask = f"{P}.mask_X.bed"
-        write_bed(merge_intervals(pd.concat([base, whole([c for c in fai["chrom"] if c not in x_chroms])])), x_mask)
+        write_mask(pd.concat([base, whole([c for c in fai["chrom"] if c not in x_chroms])]), x_mask, fai)
         runs.append(("autosomes", "autosomes (X masked; it gets its own pool sizes below)", auto_mask,
                      args.pool_size_arg, args.min_depth, args.max_depth, args.sample_masks))
         runs.append(("X", "X chromosome, with per-pool X pool sizes (fewer copies in pools with males)", x_mask,
@@ -1094,7 +1107,7 @@ def cmd_commands(args):
                      args.total_mask, args.pool_size_arg, args.min_depth, args.max_depth, args.sample_masks))
     if mito and cc.get("MITO_SEPARATE", "0") == "1":
         m_mask = f"{P}.mask_mito.bed"
-        write_bed(whole([c for c in fai["chrom"] if c not in mito]), m_mask)
+        write_mask(whole([c for c in fai["chrom"] if c not in mito]), m_mask, fai)
         runs.append(("mito", "mitochondrion: haploid, pool size = individuals, its own depth bounds "
                      "(whole genome as one window)", m_mask, cc.get("MITO_POOL_SIZES", args.pool_size_arg),
                      cc.get("MITO_MIN_DEPTH", args.min_depth), cc.get("MITO_MAX_DEPTH", args.max_depth),

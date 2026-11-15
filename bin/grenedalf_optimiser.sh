@@ -530,17 +530,27 @@ step_grid() {
     runs+=("no_accessibility_mask $mc $MIN_FOLD $MAX_FOLD shared $g/minimal_mask.bed fold")
 
     local assess=() spec r rmc rmin rmax rmode rbase rmethod
+    rm -f "$g/failed_runs.tsv"
     for spec in "${runs[@]}"; do
         read -r r rmc rmin rmax rmode rbase rmethod <<<"$spec"
         log "grid run $r"
         mkdir -p "$g/$r"
         depthmask "$g/$r/mask" "$rmin" "$rmax" "$rmode" "$rbase" "$rmethod" > "$g/$r/depthmask.txt"
         # shellcheck source=/dev/null
-        ( source "$g/$r/mask.depthmask.params"
-          run_grenedalf "$g/$r" "$TOTAL_MASK_BED" "$SAMPLE_MASK_LIST" "$rmc" "$MIN_DEPTH" "$MAX_DEPTH" \
-              "$WINDOW" "$STRIDE" )
+        # One failed run does not stop the grid: it is recorded, left out of the assessment,
+        # and listed in the report
+        if ! ( source "$g/$r/mask.depthmask.params"
+               run_grenedalf "$g/$r" "$TOTAL_MASK_BED" "$SAMPLE_MASK_LIST" "$rmc" "$MIN_DEPTH" "$MAX_DEPTH" \
+                   "$WINDOW" "$STRIDE" ); then
+            local why
+            why=$(grep -h -m1 -i -E "error|what\(\)" "$g/$r"/*.log 2> /dev/null | head -1 | tr '\t' ' ')
+            log "grid run $r FAILED (left out): ${why:-see $g/$r/*.log}"
+            printf '%s\t%s\n' "$r" "${why:-see $g/$r/*.log}" >> "$g/failed_runs.tsv"
+            continue
+        fi
         assess+=(--run "$r" "$g/$r/diversity.csv" "$g/$r/fst.csv")
     done
+    [[ ${#assess[@]} -gt 0 ]] || { echo "every grid run failed: see $g/failed_runs.tsv" >&2; exit 1; }
     for n in "${NAMES[@]}"; do assess+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz"); done
     "${OPTIMISER[@]}" assess "${assess[@]}" --min-snps "$MIN_SNPS" --tolerance "$TOLERANCE" --out "$P"
 }
