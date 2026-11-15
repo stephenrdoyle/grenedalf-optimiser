@@ -51,6 +51,13 @@ for p in "${POOLS[@]}"; do r+=(--depth "$p" "$D/$p.mq30.regions.bed.gz"); done
     --run artefact "$D/artefact.diversity.csv" "$D/artefact.fst.csv" "${r[@]}" \
     --strict clean --min-snps 20 --out "$D/optimiser"
 
+v=()
+for p in "${POOLS[@]}"; do v+=(--depth "$p" "$D/$p.mq30.regions.bed.gz" --dist "$p" "$D/$p.mosdepth.region.dist.txt"); done
+"${OPTIMISER[@]}" variance "${v[@]}" --mask-summary "$D/optimiser.mask_summary.tsv" --chrom-class "$D/optimiser.chrom_class.tsv" \
+    --thresholds "$D/optimiser.depth_thresholds.tsv" --mask-bed "$D/optimiser.mask.bed" --out "$D/optimiser" > /dev/null
+"${OPTIMISER[@]}" depthmask "${q[@]}" --thresholds "$D/optimiser.depth_thresholds.tsv" --chrom-class "$D/optimiser.chrom_class.tsv" \
+    --fai "$D/ref.fa.fai" --base-mask "$D/optimiser.mask.bed" --mode shared --bound-method fitted --out "$D/fitted" > /dev/null
+
 "${OPTIMISER[@]}" commands --prefix "$D/optimiser" --out-dir "$D" --fai "$D/ref.fa.fai" \
     --bam "${POOLS[@]/%/.bam}" --x-chroms sim_chrX --total-mask "$D/optimiser.total_mask.bed" --pool-size-arg 400 \
     --min-count 3 --min-depth 10 --max-depth 282 --window 6000 --stride 3000 --min-snps 50
@@ -122,6 +129,20 @@ awk -F'\t' '$2 != 300 {bad=1} END {exit bad}' "$D/hix/c.x_pool_sizes.tsv" || fai
 awk -F'\t' 'NR>1 {l[$6]=1} END {exit length(l) < 3}' "$D/optimiser.mito.tsv" || fail "mito bounds not per pool"
 grep -q -- "--filter-mask-samples-bed-list $D/optimiser.mito_sample_masks.tsv" "$D/grenedalf_commands.sh" \
     || fail "mito run without per-pool masks"
+
+# Coverage variance: simulated depth varies in 5 kb blocks shared by all pools (GC-like), so most
+# variance persists at 1 kb, pools correlate, and poolB's deletion is a pool-specific low block
+awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 && $h["class"]=="A" && $h["share_1kb"] < 0.3 {bad=1} END {exit bad}' \
+    "$D/optimiser.variance.tsv" || fail "variance: regional share at 1 kb unexpectedly low"
+awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 && $h["mean_corr_with_others"] < 0.5 {bad=1} END {exit bad}' \
+    "$D/optimiser.variance.tsv" || fail "variance: pools' depth not correlated"
+awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 && $1=="poolB_L3" && $h["pool_specific"] > 0 {ok=1} END {exit !ok}' \
+    "$D/optimiser.variance.tsv" || fail "variance: poolB deletion not pool-specific"
+# Fitted bounds: within each pool's distribution, and a different mask from the fold bounds
+awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 && !($h["fit_lower"] < $h["median"] && $h["median"] < $h["fit_upper"]) {bad=1} END {exit bad}' \
+    "$D/optimiser.depth_thresholds.tsv" || fail "fitted bounds do not bracket the median"
+grep -q "BOUND_METHOD=fitted" "$D/fitted.depthmask.params" || fail "fitted bound method not recorded"
+! cmp -s "$D/fitted.total_mask.bed" "$D/optimiser.total_mask.bed" || fail "fitted bounds gave the same mask as fold bounds"
 
 # Nothing named: every contig autosomal, one nuclear run, no X or mito run
 "${OPTIMISER[@]}" chromclass "${c[@]}" --fai "$D/ref.fa.fai" --mask-bed "$D/optimiser.mask.bed" --pool-sizes 400 \

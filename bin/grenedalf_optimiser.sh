@@ -16,6 +16,7 @@
 #   profile    per-pool depth distribution in the accessible genome, samtools stats
 #   thresholds per-pool depth bounds, minimum allele count, quantize cut points
 #   chromclass do X and mitochondrion depth differ from autosomes? (separate runs, pool sizes)
+#   variance   kind of depth variation: spread vs sampling noise, blocks vs scatter, shared vs pool-specific
 #   quantize   mosdepth --quantize per pool at those cut points
 #   depthmask  depth masks for the recommended bounds
 #   pilot      grenedalf with the recommended settings -> linkage scale, window width, mask check
@@ -379,6 +380,16 @@ step_chromclass() {
         --min-fold "$MIN_FOLD" --max-fold "$MAX_FOLD" --abs-min-depth "$ABS_MIN_DEPTH" --out "$P"
 }
 
+step_variance() {
+    load_params
+    local a=()
+    for n in "${NAMES[@]}"; do
+        a+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz" --dist "$n" "$OUT/profile/$n.mosdepth.region.dist.txt")
+    done
+    "${OPTIMISER[@]}" variance "${a[@]}" --mask-summary "$P.mask_summary.tsv" --chrom-class "$P.chrom_class.tsv" \
+        --thresholds "$P.depth_thresholds.tsv" --mask-bed "$MASK_BED" --out "$P"
+}
+
 step_quantize() {
     for i in "${!BAMS[@]}"; do
         n=${NAMES[$i]}
@@ -388,12 +399,12 @@ step_quantize() {
     done
 }
 
-# depthmask PREFIX MIN_FOLD MAX_FOLD MODE BASE_MASK
+# depthmask PREFIX MIN_FOLD MAX_FOLD MODE BASE_MASK [BOUND_METHOD]
 depthmask() {
     local a=()
     for n in "${NAMES[@]}"; do a+=(--quantized "$n" "$OUT/quantize/$n.quantized.bed.gz"); done
     "${OPTIMISER[@]}" depthmask "${a[@]}" --thresholds "$P.depth_thresholds.tsv" --chrom-class "$P.chrom_class.tsv" \
-        --fai "$FAI" --base-mask "$5" --min-fold "$2" --max-fold "$3" --mode "$4" --out "$1"
+        --fai "$FAI" --base-mask "$5" --min-fold "$2" --max-fold "$3" --mode "$4" --bound-method "${6:-fold}" --out "$1"
 }
 
 step_depthmask() {
@@ -434,21 +445,24 @@ step_grid() {
     awk '$4 ~ /excluded|gap/' "$P.mask_reasons.bed" | cut -f1-3 > "$g/minimal_mask.bed"
 
     # One setting changed at a time from the recommended one
-    # Each run: name, min count, lower fold, upper fold, mask mode, accessibility mask
-    runs+=("recommended $mc $MIN_FOLD $MAX_FOLD shared $MASK_BED")
-    if [[ $mc -gt 1 ]]; then runs+=("min_count_$((mc - 1)) $((mc - 1)) $MIN_FOLD $MAX_FOLD shared $MASK_BED"); fi
-    runs+=("min_count_$((mc + 1)) $((mc + 1)) $MIN_FOLD $MAX_FOLD shared $MASK_BED")
-    for f in ${GRID_MIN_FOLDS//,/ }; do runs+=("min_fold_$f $mc $f $MAX_FOLD shared $MASK_BED"); done
-    for f in ${GRID_MAX_FOLDS//,/ }; do runs+=("max_fold_$f $mc $MIN_FOLD $f shared $MASK_BED"); done
-    runs+=("per_sample_masks $mc $MIN_FOLD $MAX_FOLD per-sample $MASK_BED")
-    runs+=("no_accessibility_mask $mc $MIN_FOLD $MAX_FOLD shared $g/minimal_mask.bed")
+    # Each run: name, min count, lower fold, upper fold, mask mode, accessibility mask, bound method
+    runs+=("recommended $mc $MIN_FOLD $MAX_FOLD shared $MASK_BED fold")
+    if [[ $mc -gt 1 ]]; then runs+=("min_count_$((mc - 1)) $((mc - 1)) $MIN_FOLD $MAX_FOLD shared $MASK_BED fold"); fi
+    runs+=("min_count_$((mc + 1)) $((mc + 1)) $MIN_FOLD $MAX_FOLD shared $MASK_BED fold")
+    for f in ${GRID_MIN_FOLDS//,/ }; do runs+=("min_fold_$f $mc $f $MAX_FOLD shared $MASK_BED fold"); done
+    for f in ${GRID_MAX_FOLDS//,/ }; do runs+=("max_fold_$f $mc $MIN_FOLD $f shared $MASK_BED fold"); done
+    # bounds from each pool's fitted coverage distribution instead of fixed folds
+    runs+=("fitted_bounds $mc $MIN_FOLD $MAX_FOLD shared $MASK_BED fitted")
+    runs+=("fitted_bounds_per_sample $mc $MIN_FOLD $MAX_FOLD per-sample $MASK_BED fitted")
+    runs+=("per_sample_masks $mc $MIN_FOLD $MAX_FOLD per-sample $MASK_BED fold")
+    runs+=("no_accessibility_mask $mc $MIN_FOLD $MAX_FOLD shared $g/minimal_mask.bed fold")
 
-    local assess=() spec r rmc rmin rmax rmode rbase
+    local assess=() spec r rmc rmin rmax rmode rbase rmethod
     for spec in "${runs[@]}"; do
-        read -r r rmc rmin rmax rmode rbase <<<"$spec"
+        read -r r rmc rmin rmax rmode rbase rmethod <<<"$spec"
         log "grid run $r"
         mkdir -p "$g/$r"
-        depthmask "$g/$r/mask" "$rmin" "$rmax" "$rmode" "$rbase" > "$g/$r/depthmask.txt"
+        depthmask "$g/$r/mask" "$rmin" "$rmax" "$rmode" "$rbase" "$rmethod" > "$g/$r/depthmask.txt"
         # shellcheck source=/dev/null
         ( source "$g/$r/mask.depthmask.params"
           run_grenedalf "$g/$r" "$TOTAL_MASK_BED" "$SAMPLE_MASK_LIST" "$rmc" "$MIN_DEPTH" "$MAX_DEPTH" \
@@ -528,7 +542,7 @@ step_report() {
 }
 
 case "$STEP" in
-    run|check|mask|profile|thresholds|chromclass|quantize|depthmask|pilot|grid|params|report) "step_$STEP" ;;
-    all) for s in mask profile thresholds chromclass quantize depthmask pilot grid params report; do log "== $s"; "step_$s"; done ;;
+    run|check|mask|profile|thresholds|chromclass|variance|quantize|depthmask|pilot|grid|params|report) "step_$STEP" ;;
+    all) for s in mask profile thresholds chromclass variance quantize depthmask pilot grid params report; do log "== $s"; "step_$s"; done ;;
     *) echo "unknown step: $STEP" >&2; exit 1 ;;
 esac

@@ -642,6 +642,12 @@ def section_depth(P, dists):
             if c in cur:
                 surv = (1 - np.cumsum(cur[c]) + cur[c])[: int(xmax) + 1]
                 xs = np.arange(surv.size)
+                if "fit_mu" in g and pd.notna(g.loc[c, "fit_mu"]):
+                    from grenedalf_optimiser import nb_cdf
+                    pi_ = float(g.loc[c, "fit_low_component"]) if "fit_low_component" in g else 0.0
+                    fc = nb_cdf(float(g.loc[c, "fit_mu"]), float(g.loc[c, "fit_size"]), surv.size)
+                    model = 1 - (pi_ + (1 - pi_) * np.concatenate(([0.0], fc[:-1])))[: surv.size]
+                    p.line(xs, model, "var(--neutral)", "fitted model")
                 lo, hi, med = g.loc[c, "lower"], g.loc[c, "upper"], g.loc[c, "median"]
                 stepx = max(1, surv.size // 40)
                 p.line(xs, surv, color, name,
@@ -650,7 +656,9 @@ def section_depth(P, dists):
         a = g.loc["A"] if "A" in g.index else g.iloc[0]
         legend = ('<div class="legend"><span><span class="key" style="background:var(--s1)"></span>autosomes</span>'
                   + ('<span><span class="key" style="background:var(--s2)"></span>X</span>' if "X" in cur else "")
-                  + '<span><span class="key" style="background:var(--s1-wash);height:10px"></span>kept (autosomes)</span></div>')
+                  + '<span><span class="key" style="background:var(--s1-wash);height:10px"></span>kept (autosomes)</span>'
+                  + ('<span><span class="key" style="background:var(--neutral)"></span>fitted coverage model</span>'
+                     if "fit_mu" in g else "") + '</div>')
         panels.append(f"<div><h3>{esc(pool)} · median {a['median']}×, autosomes kept {a['lower']}–{a['upper']} "
                       f"({pct(a['frac_kept'])} of sites)</h3>{legend}{p.svg(f'{pool} depth distribution')}</div>")
     cols = [c for c in ("pool", "class", "median", "q05", "q95", "lower", "upper", "frac_below", "frac_above", "frac_kept")
@@ -711,6 +719,68 @@ def pool_size_note(mc):
             + (" Alleles present as one or a few copies in a pool fall below the minimum count; rare-variant "
                "statistics are affected more than common-variant ones." if low else "") + "</p>"
             + plain_table(t))
+
+
+def section_variance(P):
+    v = read_tsv(f"{P}.variance.tsv")
+    thr = read_tsv(f"{P}.depth_thresholds.tsv")
+    if v is None:
+        return ""
+    a = v[v["class"] == "A"] if (v["class"] == "A").any() else v
+    ratio = float((a["cv"] / a["poisson_cv"]).median())
+    s1, s10 = float(a["share_1kb"].median()), float(a["share_10kb"].median())
+    blocks = float(a.loc[a["low_bins"] > 0, "low_in_blocks"].median()) if (a["low_bins"] > 0).any() else np.nan
+    spec = float(a.loc[a["low_bins"] > 0, "pool_specific"].median()) if (a["low_bins"] > 0).any() else np.nan
+    shared = float(a.loc[a["low_bins"] > 0, "shared_half_or_more"].median()) if (a["low_bins"] > 0).any() else np.nan
+    corr_m = float(a["mean_corr_with_others"].median())
+    li = [f"<li><strong>Spread:</strong> autosomal coverage varies {ratio:.1f}× more than read sampling alone "
+          f"would (CV {a['cv'].median():.2f} against {a['poisson_cv'].median():.2f} for pure sampling noise). "
+          "Fixed-fold bounds assume sampling-like spread; with this much more, 0.5× the median sits closer to the "
+          "middle of the distribution than 2× does, so far more is cut below than above.</li>",
+          f"<li><strong>Scale:</strong> {100 * s1:.0f}% of the per-base variance persists in 1 kb means and "
+          f"{100 * s10:.0f}% in 10 kb means. "
+          + ("Depth varies mostly in regional blocks (mapping, divergence, GC, copy number), not as scattered noise."
+             if s1 >= 0.5 else "Much of the variation is local noise that averages out within 1 kb.") + "</li>"]
+    if np.isfinite(blocks):
+        li.append(f"<li><strong>Low depth:</strong> {100 * blocks:.0f}% of the 1 kb bins below a pool's lower bound "
+                  f"lie in runs of at least 5 kb. Of a pool's low bins, {100 * spec:.0f}% are low in that pool only "
+                  f"(population divergence, deletions: biology to report, not to mask everywhere) and "
+                  f"{100 * shared:.0f}% are low in at least half the pools (reference or technical).</li>")
+    li.append(f"<li><strong>Between pools:</strong> 1 kb depth correlates at {corr_m:.2f} (median), so most "
+              "coverage structure is shared by all pools.</li>")
+    cols = ["pool", "class", "mean", "cv", "poisson_cv", "share_1kb", "share_10kb", "low_bins_frac", "low_in_blocks",
+            "pool_specific", "shared_half_or_more"]
+    tv = v[[c for c in cols if c in v]].copy()
+    for c in ("share_1kb", "share_10kb", "low_bins_frac", "low_in_blocks", "pool_specific", "shared_half_or_more"):
+        if c in tv:
+            tv[c] = tv[c].map(lambda x: "–" if pd.isna(x) else pct(x))
+    tv.columns = [{"cv": "CV", "poisson_cv": "CV (sampling only)", "share_1kb": "variance at 1 kb",
+                   "share_10kb": "at 10 kb", "low_bins_frac": "low 1 kb bins", "low_in_blocks": "low, in blocks",
+                   "pool_specific": "low, this pool only", "shared_half_or_more": "low, ≥ half the pools"}.get(c, c)
+                  for c in tv.columns]
+    corr = read_tsv(f"{P}.depth_correlation.tsv")
+    corr_html = ""
+    if corr is not None:
+        corr = corr.rename(columns={corr.columns[0]: "pool"})
+        corr_html = ("<h3>1 kb depth correlation between pools (Spearman)</h3>"
+                     + heat_table(corr, list(corr.columns[1:]), lambda x: f"{x:.2f}", vmax=1.0))
+    bounds_html = ""
+    if thr is not None and "fit_lower" in thr:
+        tb = thr[["pool", "class", "median", "lower", "upper", "frac_below", "frac_above",
+                  "fit_lower", "fit_upper", "fit_frac_below", "fit_frac_above", "fit_low_component"]].copy()
+        for c in ("frac_below", "frac_above", "fit_frac_below", "fit_frac_above", "fit_low_component"):
+            tb[c] = tb[c].map(pct)
+        tb.columns = ["pool", "class", "median", "fold: from", "to", "cut below", "cut above",
+                      "fitted: from", "to ", "cut below ", "cut above ", "low-depth component"]
+        bounds_html = ("<h3>Fixed-fold against fitted bounds</h3><p>Fitted bounds are the 0.5% and 99.5% points of a "
+                       "negative binomial fitted to each pool's main coverage, with a separate low-depth component "
+                       "(sites whose reads largely fail to map), so the bounds follow the pool's own spread and cut "
+                       "the same tail probability on both sides. The grid runs both (<code>fitted_bounds</code>) and the "
+                       "artefact test decides.</p>" + plain_table(tb))
+    return ("<section><h2>Coverage variance</h2><p>What kind of depth variation there is decides what a depth "
+            "bound removes: sampling noise (harmless, and the estimators handle it), regional blocks shared by all "
+            "pools (reference or technical: mask), or blocks in single pools (biology: report).</p>"
+            "<ul>" + "".join(li) + "</ul>" + plain_table(tv) + corr_html + bounds_html + "</section>")
 
 
 def section_chromclass(P):
@@ -932,7 +1002,8 @@ def build_report(args):
         prof = os.path.join(out_dir, "profile")
         dists = [(f[: -len(".mosdepth.region.dist.txt")], os.path.join(prof, f)) for f in sorted(os.listdir(prof))
                  if f.endswith(".mosdepth.region.dist.txt")]
-    sections = [section_summary(P, out_dir), section_mask(P), section_karyoplot(P, out_dir), section_depth(P, dists), section_chromclass(P), section_min_count(P),
+    sections = [section_summary(P, out_dir), section_mask(P), section_karyoplot(P, out_dir), section_depth(P, dists),
+                section_variance(P), section_chromclass(P), section_min_count(P),
                 section_ld(P), section_windows(P), section_grid(P)]
     title = args.title or "grenedalf optimiser report"
     page = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'

@@ -21,6 +21,9 @@ Subcommands (run in this order; grenedalf_optimiser.sh runs the external tools b
               depth distribution inside the accessible genome, the minimum allele
               count implied by the base-quality cut-off, and the mosdepth --quantize
               cut points needed to build depth masks.
+  variance    what kind of depth variation there is: spread against read-sampling noise,
+              how much persists at 1-10 kb (blocks vs noise), and whether low depth is
+              shared by the pools (technical) or specific to one (population divergence).
   depthmask   per-pool depth masks from mosdepth --quantize output; either merged
               into one mask (shared: every pool is called at the same sites) or kept
               per sample (grenedalf --filter-mask-samples-bed-list).
@@ -367,6 +370,63 @@ def pmf_quantile(pmf, q):
     return int(np.searchsorted(np.cumsum(pmf), q))
 
 
+def nb_cdf(mu, size, kmax, lg_k1=None, lg_ks=None):
+    """Negative binomial (mean mu, dispersion size) cdf at 0..kmax."""
+    k = np.arange(kmax + 1, dtype=float)
+    if lg_k1 is None:
+        lg_k1 = np.vectorize(math.lgamma)(k + 1)
+    if lg_ks is None:
+        lg_ks = np.vectorize(math.lgamma)(k + size)
+    p = size / (size + mu)
+    logpmf = lg_ks - math.lgamma(size) - lg_k1 + size * math.log(p) + k * math.log1p(-p)
+    return np.cumsum(np.exp(logpmf))
+
+
+def fit_depth_distribution(pmf, from_peak=0.6, q_to=0.99):
+    """Fit the main coverage component of a depth distribution: a negative binomial, with a
+    fraction pi of sites in a separate low-depth component (reads that fail to map:
+    divergent haplotypes, deletions). The fit uses depths from from_peak x the peak of the
+    distribution (where most reads are) up to its 99th percentile, where the low component has ended and the
+    cdf is pi + (1 - pi) * NB cdf; so the low tail neither drags the mean down nor
+    inflates the spread. Returns (mu, size, pi)."""
+    cdf = np.cumsum(pmf)
+    k_all = np.arange(pmf.size)
+    # Anchor on where most reads are (peak of depth x frequency): a dense low-depth tail can
+    # outnumber the main peak in sites, but not in reads
+    smooth = np.convolve(pmf * k_all, np.ones(5) / 5, mode="same")
+    peak = int(np.argmax(smooth[1:]) + 1) if pmf.size > 2 else 1
+    x0 = max(int(from_peak * peak), 1)
+    x1 = max(int(np.searchsorted(cdf, q_to)), x0 + 2)
+    xs = np.unique(np.linspace(x0, x1, 30).astype(int))
+    target = cdf[xs]
+    kmax = int(x1 * 3 + 20)
+    k = np.arange(kmax + 1, dtype=float)
+    lg = np.vectorize(math.lgamma)
+    lg_k1 = lg(k + 1)
+    pis = np.linspace(0, 0.7, 36)[:, None]
+    best = (np.inf, float(peak), 10.0, 0.0)
+    for size in np.logspace(-0.3, 3, 50):
+        lg_ks = lg(k + size)
+        for mu in np.linspace(0.5 * peak, 1.3 * peak, 46):
+            c = nb_cdf(mu, size, kmax, lg_k1, lg_ks)[xs]
+            loss = np.sum((pis + (1 - pis) * c[None, :] - target[None, :]) ** 2, axis=1)
+            i = int(np.argmin(loss))
+            if loss[i] < best[0]:
+                best = (float(loss[i]), mu, size, float(pis[i, 0]))
+    return best[1], best[2], best[3]
+
+
+def nb_quantile(mu, size, q):
+    kmax = int(mu * 10 + 50)
+    return int(np.searchsorted(nb_cdf(mu, size, kmax), q))
+
+
+def fitted_bounds(mu, size, q_low, q_high, abs_min):
+    lower = max(abs_min, nb_quantile(mu, size, q_low))
+    upper = max(lower, nb_quantile(mu, size, q_high))
+    return lower, upper
+
+
 def depth_bounds(median, min_fold, max_fold, abs_min):
     lower = max(abs_min, int(math.floor(min_fold * median)))
     upper = max(lower, int(math.ceil(max_fold * median)))
@@ -434,8 +494,20 @@ def cmd_thresholds(args):
             for xf in max_folds:
                 cuts.add(depth_bounds(median, args.min_fold, xf, args.abs_min_depth)[1] + 1)
             cdf = np.cumsum(pmf)
+            mu, size, pi_low = fit_depth_distribution(pmf)
+            fl, fu = fitted_bounds(mu, size, args.fit_low_q, args.fit_high_q, args.abs_min_depth)
+            cuts.update({fl, fu + 1})
+            mean = float(np.sum(np.arange(pmf.size) * pmf))
+            sd = float(np.sqrt(np.sum((np.arange(pmf.size) - mean) ** 2 * pmf)))
             rows.append({
                 "pool": name, "class": cls, "accessible_bp": int(w), "median": median,
+                "mean": round(mean, 2), "sd": round(sd, 2), "cv": round(sd / mean, 3) if mean else np.nan,
+                "poisson_cv": round(1 / math.sqrt(mean), 3) if mean else np.nan,
+                "fit_mu": round(mu, 2), "fit_size": round(size, 3), "fit_low_component": round(pi_low, 3),
+                "fit_cv": round(math.sqrt(mu + mu * mu / size) / mu, 3),
+                "fit_lower": fl, "fit_upper": fu,
+                "fit_frac_below": round(float(cdf[fl - 1]) if fl > 0 else 0.0, 4),
+                "fit_frac_above": round(max(float(1 - cdf[fu]), 0.0) if fu < cdf.size else 0.0, 4),
                 "q01": pmf_quantile(pmf, 0.01), "q05": pmf_quantile(pmf, 0.05),
                 "q95": pmf_quantile(pmf, 0.95), "q99": pmf_quantile(pmf, 0.99),
                 "frac_zero": round(float(pmf[0]), 4),
@@ -528,8 +600,11 @@ def cmd_depthmask(args):
         t = thr[thr["pool"] == name].set_index("class")
         if t.empty:
             sys.exit(f"{name} is not in {args.thresholds}")
-        bounds = {cls: depth_bounds(r["median"], args.min_fold, args.max_fold, int(r["abs_min_depth"]))
-                  for cls, r in t.iterrows()}
+        if args.bound_method == "fitted":
+            bounds = {cls: (int(r["fit_lower"]), int(r["fit_upper"])) for cls, r in t.iterrows()}
+        else:
+            bounds = {cls: depth_bounds(r["median"], args.min_fold, args.max_fold, int(r["abs_min_depth"]))
+                      for cls, r in t.iterrows()}
         q = pd.read_csv(path, sep="\t", header=None, names=["chrom", "start", "end", "label"],
                         dtype={"chrom": str, "start": np.int64, "end": np.int64, "label": str})
         q = q[q["chrom"].isin(classes)]
@@ -558,6 +633,7 @@ def cmd_depthmask(args):
     lowers = [v for r in rows for k, v in r.items() if k.startswith("lower_")]
     uppers = [v for r in rows for k, v in r.items() if k.startswith("upper_")]
     params = {"MIN_FOLD": args.min_fold, "MAX_FOLD": args.max_fold, "MASK_MODE": args.mode,
+              "BOUND_METHOD": args.bound_method,
               "MIN_DEPTH": min(lowers), "MAX_DEPTH": max(uppers)}
     if args.mode == "shared":
         total = merge_intervals(pd.concat([base] + list(per_pool.values()), ignore_index=True))
@@ -578,6 +654,118 @@ def cmd_depthmask(args):
     summary.to_csv(f"{args.out}.depthmask_summary.tsv", sep="\t", index=False)
     write_params(f"{args.out}.depthmask.params", params)
     print(summary.to_string(index=False))
+
+
+# ---------------------------------------------------------------------------
+# variance
+
+def cmd_variance(args):
+    """What kind of depth variation is there, and what kind of low depth is being cut?
+
+    Per pool and chromosome class:
+      spread       per-base mean, SD and CV, against the CV of pure read-sampling noise
+                   (Poisson, 1/sqrt(mean)); var/mean = 1 for Poisson
+      scale        share of the per-base variance that persists in 1 kb and 10 kb means.
+                   Sampling noise averages away within a few read lengths; regional effects
+                   (divergent haplotypes, GC, copy number) do not. High shares: depth varies
+                   in blocks; low: it is scattered noise
+      low depth    of the 1 kb bins below the pool's lower bound, the share in runs of at
+                   least --block-bins bins (blocks, not speckle), and the share that no other
+                   pool is low in (pool-specific: population divergence or deletion) or that
+                   at least half the pools are low in (shared: reference or technical)
+    Between pools: Spearman correlation of 1 kb depth (each pool normalised to its median)."""
+    weights = {}
+    if args.mask_summary:
+        ms = pd.read_csv(args.mask_summary, sep="\t", dtype={"chrom": str})
+        weights = dict(zip(ms["chrom"], ms["accessible"]))
+    classes = dict(pd.read_csv(args.chrom_class, sep="\t", dtype={"chrom": str}).itertuples(index=False))
+    thr = pd.read_csv(args.thresholds, sep="\t").set_index(["pool", "class"])
+    dists = dict(args.dist or [])
+    mask = merge_intervals(read_bed(args.mask_bed)) if args.mask_bed else None
+
+    rows, norm, low = [], {}, {}
+    for name, path in args.depth:
+        b = read_mosdepth_bins(path, "d")
+        b = b[b["chrom"].isin(classes)].copy()
+        b["class"] = b["chrom"].map(classes)
+        if mask is not None:   # bins at least half accessible
+            frac = np.zeros(len(b))
+            for chrom, idx in b.groupby("chrom").indices.items():
+                m = mask[mask["chrom"] == chrom]
+                if m.empty:
+                    continue
+                g = b.iloc[idx]
+                cs = coverage_prefix(m, int(g["end"].max()))
+                frac[idx] = (cs[g["end"].to_numpy()] - cs[g["start"].to_numpy()]) / (g["end"] - g["start"]).to_numpy()
+            b = b[frac < 0.5]
+        key = b["chrom"] + ":" + b["start"].astype(str)
+        pmfs = read_dist(dists[name]) if name in dists else {}
+        for cls, g in b.groupby("class"):
+            # per-base spread from the mosdepth distribution (accessible genome)
+            acc = np.zeros(1)
+            for chrom, pmf in pmfs.items():
+                w = float(weights.get(chrom, 0))
+                if classes.get(chrom) != cls or w <= 0:
+                    continue
+                n = max(acc.size, pmf.size)
+                acc = np.pad(acc, (0, n - acc.size)) + np.pad(pmf * w, (0, n - pmf.size))
+            if acc.sum() > 0:
+                acc = acc / acc.sum()
+                k = np.arange(acc.size)
+                mean_b = float(np.sum(k * acc)); var_b = float(np.sum((k - mean_b) ** 2 * acc))
+            else:
+                mean_b, var_b = float(g["d"].mean()), np.nan
+            d1 = g["d"].to_numpy()
+            g10 = g.assign(blk=g["start"] // 10_000).groupby(["chrom", "blk"])["d"].agg(["mean", "size"])
+            d10 = g10.loc[g10["size"] >= 5, "mean"].to_numpy()
+            lower = int(thr.loc[(name, cls), "lower"]) if (name, cls) in thr.index else np.nan
+            is_low = d1 < lower
+            # runs of consecutive low bins (adjacent starts on the same chromosome)
+            gs = g.assign(low=is_low).sort_values(["chrom", "start"])
+            brk = (gs["low"] != gs["low"].shift()) | (gs["chrom"] != gs["chrom"].shift()) | \
+                  (gs["start"] - gs["end"].shift() != 0)
+            run_id = brk.cumsum()
+            run_len = gs.groupby(run_id)["low"].transform("size")
+            in_block = (gs["low"] & (run_len >= args.block_bins)).sum()
+            rows.append({
+                "pool": name, "class": cls, "bins": len(g),
+                "mean": round(mean_b, 2), "sd": round(math.sqrt(var_b), 2) if np.isfinite(var_b) else np.nan,
+                "cv": round(math.sqrt(var_b) / mean_b, 3) if np.isfinite(var_b) and mean_b else np.nan,
+                "poisson_cv": round(1 / math.sqrt(mean_b), 3) if mean_b else np.nan,
+                "var_over_mean": round(var_b / mean_b, 2) if np.isfinite(var_b) and mean_b else np.nan,
+                "share_1kb": round(float(np.var(d1)) / var_b, 3) if np.isfinite(var_b) and var_b else np.nan,
+                "share_10kb": round(float(np.var(d10)) / var_b, 3) if np.isfinite(var_b) and var_b and d10.size else np.nan,
+                "low_bins_frac": round(float(is_low.mean()), 4),
+                "low_in_blocks": round(float(in_block / max(is_low.sum(), 1)), 3)})
+            med = float(np.median(d1[d1 > 0])) if (d1 > 0).any() else np.nan
+            norm.setdefault(name, []).append(pd.Series(d1 / med, index=key[g.index]))
+            low.setdefault(name, []).append(pd.Series(is_low, index=key[g.index]))
+
+    t = pd.DataFrame(rows)
+    nmat = pd.DataFrame({p: pd.concat(v) for p, v in norm.items()}).dropna()
+    lmat = pd.DataFrame({p: pd.concat(v) for p, v in low.items()}).fillna(False).astype(bool)
+    corr = nmat.rank().corr()
+    pools = list(lmat.columns)
+    key_class = pd.Series(lmat.index.str.rsplit(":", n=1).str[0], index=lmat.index).map(classes)
+    share = []
+    for cls in sorted(key_class.dropna().unique()):
+        lc = lmat[key_class == cls]
+        n_low = lc.sum(axis=1)
+        for p in pools:
+            lp = lc[p]
+            nl = int(lp.sum())
+            share.append({"pool": p, "class": cls, "low_bins": nl,
+                          "pool_specific": round(float((lp & (n_low == 1)).sum() / max(nl, 1)), 3),
+                          "shared_half_or_more": round(float((lp & (n_low >= math.ceil(len(pools) / 2))).sum() / max(nl, 1)), 3),
+                          "shared_all": round(float((lp & (n_low == len(pools))).sum() / max(nl, 1)), 3)})
+    sh = pd.DataFrame(share)
+    t = t.merge(sh, on=["pool", "class"], how="left")
+    t["mean_corr_with_others"] = t["pool"].map(
+        lambda p: round(float(corr.loc[p, [q for q in pools if q != p]].mean()), 3) if len(pools) > 1 else np.nan)
+    t.to_csv(f"{args.out}.variance.tsv", sep="\t", index=False)
+    corr.round(3).to_csv(f"{args.out}.depth_correlation.tsv", sep="\t")
+    print(t.to_string(index=False))
+    print("\n1 kb depth correlation between pools (Spearman)\n" + corr.round(3).to_string())
 
 
 # ---------------------------------------------------------------------------
@@ -1298,6 +1486,10 @@ def main():
     p.add_argument("--min-fold", type=float, default=0.5, help="lower depth bound = fold x median [0.5]")
     p.add_argument("--max-fold", type=float, default=2.0, help="upper depth bound = fold x median [2.0]")
     p.add_argument("--abs-min-depth", type=int, default=10, help="lower bound never below this [10]")
+    p.add_argument("--fit-low-q", type=float, default=0.005,
+                   help="fitted bounds: lower bound at this quantile of the fitted coverage distribution [0.005]")
+    p.add_argument("--fit-high-q", type=float, default=0.995,
+                   help="fitted bounds: upper bound at this quantile of the fitted coverage distribution [0.995]")
     p.add_argument("--grid-min-folds", type=floats, default=[0.33, 0.67], help="lower folds tried in the grid")
     p.add_argument("--grid-max-folds", type=floats, default=[1.5, 3.0], help="upper folds tried in the grid")
     p.add_argument("--base-qual", type=int, default=30, help="grenedalf --sam-min-base-qual [30]")
@@ -1317,11 +1509,27 @@ def main():
     p.add_argument("--base-mask", help="accessibility mask to combine with")
     p.add_argument("--min-fold", type=float, default=0.5)
     p.add_argument("--max-fold", type=float, default=2.0)
+    p.add_argument("--bound-method", choices=["fold", "fitted"], default="fold",
+                   help="fold: fold x median; fitted: quantiles of a negative binomial fitted to each pool's "
+                        "coverage (bounds follow the pool's actual spread) [fold]")
     p.add_argument("--mode", choices=["shared", "per-sample"], default="shared",
                    help="shared: one mask, every pool called at the same sites; "
                         "per-sample: one mask per pool (more sites, uneven missingness) [shared]")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_depthmask)
+
+    p = sub.add_parser("variance", help="kind of depth variation: spread, scale, sharing between pools")
+    p.add_argument("--depth", nargs=2, action="append", required=True, metavar=("POOL", "MQX_BINS"),
+                   help="mosdepth 1 kb bins at the MAPQ cut-off; repeat per pool")
+    p.add_argument("--dist", nargs=2, action="append", metavar=("POOL", "REGION_DIST"),
+                   help="mosdepth region.dist over the accessible genome (per-base spread)")
+    p.add_argument("--mask-summary", help="<out>.mask_summary.tsv (accessible bp per chromosome)")
+    p.add_argument("--chrom-class", required=True)
+    p.add_argument("--thresholds", required=True, help="<out>.depth_thresholds.tsv (lower bounds)")
+    p.add_argument("--mask-bed", help="accessibility mask; bins mostly masked are ignored")
+    p.add_argument("--block-bins", type=int, default=5, help="run of low bins counted as a block [5]")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_variance)
 
     p = sub.add_parser("windows", help="window width from SNP density in a pilot grenedalf table")
     p.add_argument("--table", required=True, help="grenedalf diversity or fst table")
