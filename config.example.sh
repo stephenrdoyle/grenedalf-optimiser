@@ -47,6 +47,9 @@ TOLERANCE=0.05       # artefact increase over the strictest run still accepted
 # Tools: the conda environment from environment.yml (bin/grenedalf_optimiser.sh CONFIG setup)
 # is activated by every step. CONDA_ENV=none uses whatever is on PATH, e.g. farm modules.
 CONDA_ENV=grenedalf-optimiser
+SCHEDULER=auto       # run: LSF when bsub is available, otherwise here; or lsf / local
+LSF_QUEUE=long
+LSF_MEM=32000        # MB; cores = THREADS
 # Commands, if not the ones in the environment
 GRENEDALF=grenedalf
 MOSDEPTH=mosdepth

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # grenedalf_optimiser.sh CONFIG STEP
 #
+# Usually just:   grenedalf_optimiser.sh CONFIG run
+#   run        setup (if the conda environment is missing), check, then the whole analysis:
+#              submitted as one LSF job when bsub is available, otherwise run here
+#              (SCHEDULER=lsf|local in the config to choose)
+#
 # Chooses grenedalf filter settings from the technical properties of pool-seq BAMs,
 # before any biological signal is looked at. See README.md.
 #
@@ -39,6 +44,9 @@ OPTIMISER=(python3 "$HERE/grenedalf_optimiser.py")
 
 # Defaults; the config overrides them
 CONDA_ENV=grenedalf-optimiser
+SCHEDULER=auto        # run: auto (LSF if bsub is available), lsf, or local
+LSF_QUEUE=long
+LSF_MEM=32000         # MB
 THREADS=4
 KMER=150
 GENMAP_ERRORS=2
@@ -148,6 +156,10 @@ step_setup() {
 if [[ "$STEP" == setup ]]; then
     step_setup
     exit 0
+fi
+if [[ "$STEP" == run && "$CONDA_ENV" != none ]] && ! { conda_init && conda_env_exists; }; then
+    log "== setup (conda environment $CONDA_ENV not found)"
+    step_setup
 fi
 activate_env
 
@@ -452,13 +464,35 @@ EOF
         --min-snps "$MIN_SNPS" --map-qual "$MAPQ" --base-qual "$BASEQ" --fst-method "$FST_METHOD" --threads "$THREADS"
 }
 
+step_run() {
+    log "== check"
+    step_check
+    local self config scheduler=$SCHEDULER
+    self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    config="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+    if [[ $scheduler == auto ]]; then
+        scheduler=local
+        command -v bsub > /dev/null && scheduler=lsf
+    fi
+    if [[ $scheduler == lsf ]]; then
+        mkdir -p "$OUT/logs"
+        bsub -q "$LSF_QUEUE" -n "$THREADS" -R "span[hosts=1] select[mem>$LSF_MEM] rusage[mem=$LSF_MEM]" -M "$LSF_MEM" \
+            -J grenedalf_optimiser -o "$OUT/logs/grenedalf_optimiser.%J.o" -e "$OUT/logs/grenedalf_optimiser.%J.e" \
+            "$self" "$config" all
+        log "submitted to LSF queue $LSF_QUEUE; logs in $OUT/logs; report will be $OUT/optimiser_report.html"
+    else
+        log "running here (no bsub, or SCHEDULER=local)"
+        "$self" "$config" all
+    fi
+}
+
 step_report() {
     "${OPTIMISER[@]}" report --prefix "$P" --out-dir "$OUT" --out "$OUT/optimiser_report.html" \
         ${REPORT_TITLE:+--title "$REPORT_TITLE"}
 }
 
 case "$STEP" in
-    check|mask|profile|thresholds|chromclass|quantize|depthmask|pilot|grid|params|report) "step_$STEP" ;;
+    run|check|mask|profile|thresholds|chromclass|quantize|depthmask|pilot|grid|params|report) "step_$STEP" ;;
     all) for s in mask profile thresholds chromclass quantize depthmask pilot grid params report; do log "== $s"; "step_$s"; done ;;
     *) echo "unknown step: $STEP" >&2; exit 1 ;;
 esac

@@ -53,7 +53,7 @@ Requirements: python3 with numpy and pandas; mosdepth, samtools, GenMap and gren
 (0.6.3); bash. All of them are in the conda environment in `environment.yml` (Linux):
 
 ```bash
-bin/grenedalf_optimiser.sh my_config.sh setup     # creates (or updates) the environment; once
+bin/grenedalf_optimiser.sh my_config.sh setup     # creates (or updates) it; run does this too if it is missing
 ```
 
 Every step then activates the environment itself (`CONDA_ENV` in the config: a name or a
@@ -62,18 +62,19 @@ interactively or in a cluster job.
 
 ```bash
 cp config.example.sh my_config.sh    # edit paths, pools, pool sizes
-bin/grenedalf_optimiser.sh my_config.sh all
+bin/grenedalf_optimiser.sh my_config.sh run
 ```
 
-Run `check` first: it takes a minute or two and catches most setup problems before a
-long job is submitted. It checks tools and python packages, grenedalf's options (and prints
-its `--pool-sizes` help so the per-pool file format can be confirmed), BAMs and their
-indexes, and BAM contig names against the reference. It also lists which contigs the
-regexes pick up as autosomes, X and mitochondrion.
+`run` does everything: creates the conda environment if it is missing, runs the `check`
+step (and stops there if anything is wrong), then runs the whole analysis, submitted as
+one LSF job when `bsub` is available (queue `LSF_QUEUE`, memory `LSF_MEM`, cores
+`THREADS`) or in the current shell otherwise (`SCHEDULER=local` forces this). Logs go to
+`OUT/logs/`, the report to `OUT/optimiser_report.html`.
 
-```bash
-bin/grenedalf_optimiser.sh my_config.sh check
-```
+`check` on its own takes a minute or two and catches most setup problems: tools and
+python packages, grenedalf's options (it prints its `--pool-sizes` help so the per-pool
+file format can be confirmed), BAMs and their indexes, BAM contig names against the
+reference, and which contigs the regexes pick up as autosomes, X and mitochondrion.
 
 Or run one step at a time (`setup check mask profile thresholds chromclass quantize depthmask pilot grid params report`).
 Each step reads what the previous ones wrote in `OUT/`. On the farm, for example:
@@ -102,15 +103,12 @@ The grid does **not** change the accessibility mask, the window width (from SNP
 density and the linkage scale), the X / mitochondrion decision, or the read filters
 (MAPQ, base quality).
 
-On the Sanger farm, `examples/submit_lsf.sh` submits the whole run as one job on the
-long queue. `examples/hcontortus_eprinomectin.config.sh` is a filled-in config for the
+On the Sanger farm, `examples/hcontortus_eprinomectin.config.sh` is a filled-in config for the
 eprinomectin pools (set `BAM_DIR`):
 
 ```bash
 git clone https://github.com/stephenrdoyle/grenedalf-optimiser.git && cd grenedalf-optimiser
-bin/grenedalf_optimiser.sh examples/hcontortus_eprinomectin.config.sh setup
-bin/grenedalf_optimiser.sh examples/hcontortus_eprinomectin.config.sh check
-examples/submit_lsf.sh examples/hcontortus_eprinomectin.config.sh
+bin/grenedalf_optimiser.sh examples/hcontortus_eprinomectin.config.sh run
 ```
 
 The memory goes on GenMap indexing and on the mask step, which holds one chromosome as
