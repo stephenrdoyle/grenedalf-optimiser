@@ -66,11 +66,19 @@ cp config.example.sh my_config.sh    # edit paths, pools, pool sizes
 bin/grenedalf_optimiser.sh my_config.sh run
 ```
 
-`run` does everything: creates the conda environment if it is missing, runs the `check`
-step (and stops there if anything is wrong), then runs the whole analysis, submitted as
-one LSF job when `bsub` is available (queue `LSF_QUEUE`, memory `LSF_MEM`, cores
-`THREADS`) or in the current shell otherwise (`SCHEDULER=local` forces this). Logs go to
-`OUT/logs/`, the report to `OUT/optimiser_report.html`.
+That is the only command you need, including after an update (`git pull`) or a config
+change: run it again. `run` creates the conda environment if it is missing, runs the
+`check` step (and stops there if anything is wrong), then runs the whole analysis,
+submitted as one LSF job when `bsub` is available (queue `LSF_QUEUE`, memory `LSF_MEM`,
+cores `THREADS`) or in the current shell otherwise (`SCHEDULER=local` forces this). Logs go
+to `OUT/logs/`, the report to `OUT/optimiser_report.html`, the recommended commands to
+`OUT/grenedalf_commands.sh`.
+
+**Reruns are cheap.** The slow steps (GenMap, mosdepth, samtools stats, every grenedalf run)
+record a signature of their inputs (settings, mask checksums, BAM size and date) and are
+reused while it matches; the fast steps always rerun. So a rerun after an update only redoes
+what the update affects. `FORCE=1 bin/grenedalf_optimiser.sh my_config.sh run` redoes
+everything.
 
 `check` on its own takes a minute or two and catches most setup problems: tools and
 python packages, grenedalf's options, BAMs and their indexes, BAM contig names against the
@@ -92,13 +100,7 @@ individuals and does not fit that model. Mitochondrial contigs are left out of t
 nuclear analysis and get their own run. `CHROM_REGEX` can optionally restrict the
 analysis to matching contigs (default: all).
 
-Or run one step at a time (`setup check mask profile thresholds chromclass quantize depthmask pilot grid params report`).
-Each step reads what the previous ones wrote in `OUT/`. On the farm, for example:
-
-```bash
-bsub -n 8 -R "span[hosts=1] select[mem>16000] rusage[mem=16000]" -M 16000 \
-    -o optimiser.%J.o -e optimiser.%J.e bin/grenedalf_optimiser.sh my_config.sh all
-```
+Individual steps exist for debugging or rebuilding one part (e.g. `bin/grenedalf_optimiser.sh my_config.sh report`); you never need them for a normal run. In order: `setup check mask profile thresholds chromclass variance quantize depthmask pilot grid params report`; each reads what the previous ones wrote in `OUT/`.
 
 The `pilot` and `grid` steps run on the **whole genome** by default, so the settings
 are judged on every chromosome rather than on one that may not be typical. The grid

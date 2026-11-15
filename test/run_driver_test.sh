@@ -30,4 +30,21 @@ for f in optimiser.mask.bed optimiser.depth_thresholds.tsv optimiser.total_mask.
          optimiser.assess_runs.tsv optimiser.chrom_classes.tsv params.sh grenedalf_commands.sh optimiser_report.html grid/per_sample_masks/mask.sample_masks.tsv; do
     [[ -s "$D/driver/$f" ]] || { echo "FAIL: missing $f" >&2; exit 1; }
 done
+# Cache: a second run with nothing changed reuses every slow result
+"$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" all > "$D/rerun.log" 2>&1
+n_reused=$(grep -c "reusing" "$D/rerun.log" || true)
+n_slow=$(grep -c -E "\] (mosdepth|profile|grenedalf|GenMap)" "$D/rerun.log" || true)
+[[ $n_reused -gt 0 && $n_reused -eq $n_slow ]] || { echo "FAIL: rerun recomputed slow steps ($n_reused reused of $n_slow)" >&2; exit 1; }
+# A setting that changes the depth masks: grenedalf runs recompute, mosdepth and GenMap are reused
+echo "MAX_FOLD=2.5" >> "$D/config.sh"
+"$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" all > "$D/rerun2.log" 2>&1
+grep -q "grenedalf recommended: reusing" "$D/rerun2.log" && { echo "FAIL: changed mask not recomputed" >&2; exit 1; }
+grep -q "mosdepth poolA_L3 MAPQ>=0: reusing" "$D/rerun2.log" || { echo "FAIL: mosdepth recomputed for a mask change" >&2; exit 1; }
+# Outputs from before the cache (no signatures): BAM-only steps adopted, the rest recomputed
+find "$D/driver" -name "*signature" -delete
+"$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" all > "$D/rerun3.log" 2>&1
+grep -q "mosdepth poolA_L3 MAPQ>=0: reusing" "$D/rerun3.log" || { echo "FAIL: pre-cache mosdepth bins not adopted" >&2; exit 1; }
+grep -q "profile poolA_L3: reusing" "$D/rerun3.log" || { echo "FAIL: pre-cache profile not adopted" >&2; exit 1; }
+grep -q "grenedalf recommended: reusing" "$D/rerun3.log" && { echo "FAIL: pre-cache grenedalf run adopted" >&2; exit 1; }
+
 echo "driver test passed ($D/driver)"

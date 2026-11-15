@@ -1,35 +1,38 @@
 #!/usr/bin/env bash
 # grenedalf_optimiser.sh CONFIG STEP
 #
-# Usually just:   grenedalf_optimiser.sh CONFIG run
-#   run        setup (if the conda environment is missing), check, then the whole analysis:
-#              submitted as one LSF job when bsub is available, otherwise run here
-#              (SCHEDULER=lsf|local in the config to choose)
-#
 # Chooses grenedalf filter settings from the technical properties of pool-seq BAMs,
 # before any biological signal is looked at. See README.md.
 #
-# Steps (run in order, or "all"):
-#   setup      create (or update) the conda environment from environment.yml; run once
+# To run everything, and again after any update (git pull) or config change:
+#
+#     grenedalf_optimiser.sh CONFIG run
+#
+# run creates the conda environment if it is missing, checks the inputs, then runs the
+# whole analysis: one LSF job when bsub is available, otherwise in this shell
+# (SCHEDULER=lsf|local in the config). Slow results (GenMap, mosdepth, grenedalf) are
+# reused while their inputs are unchanged, so a rerun only redoes what changed.
+# FORCE=1 redoes everything. Results: OUT/optimiser_report.html and OUT/grenedalf_commands.sh.
+#
+# Individual steps, optional (debugging, or rebuilding one part), in run order:
+#   setup      create (or update) the conda environment from environment.yml
 #   check      preflight: tools, python packages, grenedalf options, BAMs, indexes, contig names
 #   mask       GenMap mappability + mosdepth depth bins -> accessibility mask
 #   profile    per-pool depth distribution in the accessible genome, samtools stats
-#   thresholds per-pool depth bounds, minimum allele count, quantize cut points
-#   chromclass do X and mitochondrion depth differ from autosomes? (separate runs, pool sizes)
-#   variance   kind of depth variation: spread vs sampling noise, blocks vs scatter, shared vs pool-specific
-#   quantize   mosdepth --quantize per pool at those cut points
+#   thresholds per-pool depth bounds (fold and fitted), minimum allele count
+#   chromclass X and mitochondrion against autosomes (separate runs, pool sizes)
+#   variance   kind of depth variation: noise or blocks, shared or pool-specific
+#   quantize   mosdepth --quantize per pool at the bound cut points
 #   depthmask  depth masks for the recommended bounds
 #   pilot      grenedalf with the recommended settings -> linkage scale, window width, mask check
 #   grid       grenedalf over a grid of settings -> technical assessment
-#   params     OUT/params.sh and OUT/grenedalf_commands.sh for the full grenedalf run
-#
-# pilot and grid use the whole genome unless REGION is set (e.g. one chromosome for a quick trial).
-#   report     OUT/optimiser_report.html: every step's results in one self-contained page
+#   params     OUT/params.sh and OUT/grenedalf_commands.sh
+#   report     OUT/optimiser_report.html
+#   all        every step from mask to report, in this shell (what run submits)
+# pilot and grid use the whole genome unless REGION is set (e.g. one chromosome to try out).
 #
 # Every step activates the conda environment CONDA_ENV (default grenedalf-optimiser; a
-# name or a path) when it exists, so no "conda activate" is needed. CONDA_ENV=none uses
-# whatever is already on PATH (e.g. modules): python3 with numpy and pandas, mosdepth,
-# samtools, genmap (unless MAPPABILITY_BEDGRAPH is given) and grenedalf.
+# name or a path) when it exists; CONDA_ENV=none uses whatever is on PATH (e.g. modules).
 
 set -euo pipefail
 
@@ -94,6 +97,8 @@ if [[ -z "$MITO_CHROMS" && -n "${MITO_REGEX:-}" && -s "$FAI" ]]; then
 fi
 SEX_CHROMS=${SEX_CHROMS// /}
 MITO_CHROMS=${MITO_CHROMS// /}
+# Settings that also appear in step outputs; load_params keeps the config's values
+CONFIG_OWNED="MIN_FOLD MAX_FOLD TOLERANCE MITO_CHROMS SEX_CHROMS MALE_FRACTION POOL_SIZE POOL_SIZES TARGET_SNPS"
 
 # Pools are named as grenedalf names samples: the BAM file name without its extension
 NAMES=()
@@ -103,6 +108,32 @@ for bam in "${BAMS[@]}"; do
 done
 
 log() { echo "[$(date '+%F %T')] $*" >&2; }
+
+# --- Cache for the slow steps (GenMap, mosdepth, samtools, grenedalf). Each records a
+# signature of its exact inputs (settings, mask checksums, BAM size and date); a rerun
+# reuses the outputs while the signature matches and recomputes when anything changed.
+# FORCE=1 recomputes everything.
+file_id() { [[ -e "$1" ]] && echo "$1:$(wc -c < "$1" | tr -d ' '):$(date -r "$1" +%s)" || echo "$1:missing"; }
+file_sum() { [[ -e "$1" ]] && cksum < "$1" | cut -d' ' -f1 || echo missing; }
+bam_ids() { local b; for b in "${BAMS[@]}"; do file_id "$b"; done | tr '\n' ' '; }
+# up_to_date SIGFILE SIGNATURE OUTPUT...
+up_to_date() {
+    local sigfile=$1 sig=$2 f
+    shift 2
+    [[ "${FORCE:-0}" == 1 ]] && return 1
+    [[ -f "$sigfile" && "$(cat "$sigfile")" == "$sig" ]] || return 1
+    for f in "$@"; do [[ -s "$f" ]] || return 1; done
+}
+# up_to_date_or_adopt: as up_to_date, but outputs made before signatures existed are adopted.
+# Only for steps whose inputs are the BAMs and fixed settings (GenMap, mosdepth bins,
+# profile, frequency), which a code update cannot change.
+up_to_date_or_adopt() {
+    local sigfile=$1 sig=$2 f
+    up_to_date "$@" && return 0
+    [[ "${FORCE:-0}" == 1 || -f "$sigfile" ]] && return 1
+    for f in "${@:3}"; do [[ -s "$f" ]] || return 1; done
+    echo "$sig" > "$sigfile"
+}
 
 # conda: find it even in a non-interactive shell (LSF job), then activate CONDA_ENV
 conda_init() {
@@ -200,12 +231,18 @@ else
     POOL_SIZE_ARG=$POOL_SIZE
 fi
 
+# Results of earlier steps are read back from OUT/optimiser.*.params. Some of those files
+# also record settings the config owns (e.g. MAX_FOLD): the config always wins, so a
+# changed setting takes effect on a rerun rather than being overridden by the last run.
 load_params() {
+    local v saved=()
+    for v in $CONFIG_OWNED; do saved+=("$v=${!v-}"); done
     for f in "$P".mask.params "$P".thresholds.params "$P".chromclass.params "$P".depthmask.params \
              "$P".windows.params "$P".assess.params; do
         # shellcheck source=/dev/null
         [[ -f "$f" ]] && source "$f"
     done
+    for v in "${saved[@]}"; do printf -v "${v%%=*}" '%s' "${v#*=}"; done
     return 0
 }
 
@@ -237,10 +274,20 @@ run_grenedalf() {
     # grenedalf computes Tajima's D only with a minimum count of exactly 2
     local tajima=()
     [[ $mc != 2 ]] && tajima=(--no-tajima-d)
+    local sm_sums="" f
+    if [[ -n "$sample_masks" ]]; then
+        while IFS=$'\t' read -r _ f; do sm_sums+=" $(file_sum "$f")"; done < "$sample_masks"
+    fi
+    local gsig="${args[*]} ${tajima[*]:-} $FST_METHOD mask=$(file_sum "$mask") sample_masks=$sm_sums pools=$(file_sum "$POOL_SIZE_ARG") $(bam_ids)"
+    if up_to_date "$dir/.signature" "$gsig" "$dir/diversity.csv" "$dir/fst.csv"; then
+        log "grenedalf $(basename "$dir"): reusing"
+        return 0
+    fi
     "$GRENEDALF" diversity "${args[@]}" ${tajima[@]+"${tajima[@]}"} > "$dir/diversity.log" 2>&1 \
         || { tail -5 "$dir/diversity.log" >&2; return 1; }
     "$GRENEDALF" fst "${args[@]}" --method "$FST_METHOD" > "$dir/fst.log" 2>&1 \
         || { tail -5 "$dir/fst.log" >&2; return 1; }
+    echo "$gsig" > "$dir/.signature"
 }
 
 step_check() {
@@ -321,22 +368,31 @@ step_mask() {
     local bedgraph=$MAPPABILITY_BEDGRAPH
     if [[ -z "$bedgraph" ]]; then
         bedgraph=$(ls "$OUT"/mappability/*.genmap.bedgraph 2>/dev/null | head -1 || true)
-        if [[ -z "$bedgraph" ]]; then
+        local gsig="genmap k=$KMER e=$GENMAP_ERRORS $(file_id "$REF")"
+        if [[ -n "$bedgraph" ]] && up_to_date_or_adopt "$OUT/mappability/.signature" "$gsig" "$bedgraph"; then
+            log "GenMap mappability: reusing $bedgraph"
+        else
+            rm -f "$OUT"/mappability/*.genmap.bedgraph
             log "GenMap index and map (k=$KMER, e=$GENMAP_ERRORS)"
             rm -rf "$OUT/mappability/index"
             "$GENMAP" index -F "$REF" -I "$OUT/mappability/index"
             "$GENMAP" map -K "$KMER" -E "$GENMAP_ERRORS" -I "$OUT/mappability/index" \
                 -O "$OUT/mappability" -bg -T "$THREADS"
             bedgraph=$(ls "$OUT"/mappability/*.genmap.bedgraph | head -1)
+            echo "$gsig" > "$OUT/mappability/.signature"
         fi
     fi
     local depth_args=()
     for i in "${!BAMS[@]}"; do
         n=${NAMES[$i]}
         for mq in 0 "$MAPQ"; do
-            if [[ ! -s "$OUT/depth/$n.mq$mq.regions.bed.gz" ]]; then
+            local dsig="bins=$BIN mapq=$mq $(file_id "${BAMS[$i]}")"
+            if up_to_date_or_adopt "$OUT/depth/$n.mq$mq.signature" "$dsig" "$OUT/depth/$n.mq$mq.regions.bed.gz"; then
+                log "mosdepth $n MAPQ>=$mq: reusing"
+            else
                 log "mosdepth $n MAPQ>=$mq"
                 "$MOSDEPTH" -t "$THREADS" -n --by "$BIN" --mapq "$mq" "$OUT/depth/$n.mq$mq" "${BAMS[$i]}"
+                echo "$dsig" > "$OUT/depth/$n.mq$mq.signature"
             fi
         done
         depth_args+=(--depth "$n" "$OUT/depth/$n.mq0.regions.bed.gz" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz")
@@ -351,9 +407,15 @@ step_profile() {
     load_params
     for i in "${!BAMS[@]}"; do
         n=${NAMES[$i]}
+        local psig="mapq=$MAPQ accessible=$(file_sum "$ACCESSIBLE_BED") $(file_id "${BAMS[$i]}")"
+        if up_to_date_or_adopt "$OUT/profile/$n.signature" "$psig" "$OUT/profile/$n.mosdepth.region.dist.txt" "$OUT/profile/$n.stats"; then
+            log "profile $n: reusing"
+            continue
+        fi
         log "profile $n"
         "$MOSDEPTH" -t "$THREADS" -n --by "$ACCESSIBLE_BED" --mapq "$MAPQ" "$OUT/profile/$n" "${BAMS[$i]}"
         "$SAMTOOLS" stats -@ "$THREADS" "${BAMS[$i]}" > "$OUT/profile/$n.stats"
+        echo "$psig" > "$OUT/profile/$n.signature"
     done
 }
 
@@ -394,8 +456,14 @@ step_quantize() {
     for i in "${!BAMS[@]}"; do
         n=${NAMES[$i]}
         spec=$(awk -v n="$n" '$1 == n {print $2}' "$P.quantize.tsv")
+        local qsig="quantize=$spec mapq=$MAPQ $(file_id "${BAMS[$i]}")"
+        if up_to_date "$OUT/quantize/$n.signature" "$qsig" "$OUT/quantize/$n.quantized.bed.gz"; then
+            log "mosdepth --quantize $n: reusing"
+            continue
+        fi
         log "mosdepth --quantize $spec $n"
         "$MOSDEPTH" -t "$THREADS" -n --quantize "$spec" --mapq "$MAPQ" "$OUT/quantize/$n" "${BAMS[$i]}"
+        echo "$qsig" > "$OUT/quantize/$n.signature"
     done
 }
 
@@ -420,13 +488,17 @@ step_pilot() {
 
     # Allele counts for the linkage scale. grenedalf frequency takes no sample filters,
     # so the ld step applies the mask, minimum count and depth bounds itself.
-    if [[ ! -s "$OUT/pilot/frequency.csv.gz" ]]; then
+    local fsig="frequency mapq=$MAPQ baseq=$BASEQ $(bam_ids)"
+    if up_to_date_or_adopt "$OUT/pilot/frequency.signature" "$fsig" "$OUT/pilot/frequency.csv.gz"; then
+        log "grenedalf frequency: reusing"
+    else
         local sam=()
         for bam in "${BAMS[@]}"; do sam+=(--sam-path "$bam"); done
         "$GRENEDALF" frequency --reference-genome-fai "$FAI" --threads "$THREADS" \
             --sam-min-map-qual "$MAPQ" --sam-min-base-qual "$BASEQ" "${sam[@]}" \
             --write-sample-counts --separator-char tab --compress \
             --out-dir "$OUT/pilot" --allow-file-overwriting > "$OUT/pilot/frequency.log" 2>&1
+        echo "$fsig" > "$OUT/pilot/frequency.signature"
     fi
     local ld_region=${LD_REGION:-${REGION%%:*}}
     # shellcheck disable=SC2086
