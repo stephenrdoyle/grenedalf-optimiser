@@ -22,6 +22,7 @@ SEX_CHROMS=sim_chrX
 MITO_CHROMS=mito
 TARGET_SNPS=20
 LD_MAX_DIST=50000
+CONDA_ENV=none
 CONF
 for p in poolA_L3 poolB_L3 poolC_L3 poolD_L3 poolE_L3 poolF_L3; do touch "$D/$p.bam.bai"; echo bam > "$D/$p.bam"; done
 "$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" check

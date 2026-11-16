@@ -1,0 +1,19 @@
+# Runs both test suites on synthetic data with stand-in tools (no GenMap, mosdepth or grenedalf needed).
+name: tests
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "numpy>=1.24" "pandas>=2.0"
+      - name: unit test
+        run: test/run_test.sh "$RUNNER_TEMP/unit"
+      - name: driver test
+        run: test/run_driver_test.sh "$RUNNER_TEMP/driver"
