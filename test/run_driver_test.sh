@@ -34,6 +34,9 @@ done
 # grenedalf's mask rule: per-sample runs must not fail, and no grid run may fail
 [[ ! -s "$D/driver/grid/failed_runs.tsv" ]] || { echo "FAIL: grid runs failed: $(cat "$D/driver/grid/failed_runs.tsv")" >&2; exit 1; }
 grep -q "^per_sample_masks" "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: per_sample_masks run missing" >&2; exit 1; }
+for r in relative_bounds relative_bounds_per_sample; do
+    grep -q "^$r"$'\t' "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: $r run missing" >&2; exit 1; }
+done
 # Per-statistic judging, separately for diversity and FST: the check run is never chosen;
 # a combination run is built and judged for each
 for t in diversity fst; do

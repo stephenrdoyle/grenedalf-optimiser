@@ -67,6 +67,29 @@ for p in "${POOLS[@]}"; do v+=(--depth "$p" "$D/$p.mq30.regions.bed.gz" --dist "
 "${OPTIMISER[@]}" depthmask "${q[@]}" --thresholds "$D/optimiser.depth_thresholds.tsv" --chrom-class "$D/optimiser.chrom_class.tsv" \
     --fai "$D/ref.fa.fai" --mode per-sample --smooth 100 --out "$D/smooth" > /dev/null
 
+# Relative lower bounds: masked where a pool is low against the others, not where all are low
+rb=()
+for p in "${POOLS[@]}"; do rb+=(--bins "$p" "$D/$p.mq30.regions.bed.gz"); done
+"${OPTIMISER[@]}" depthmask "${q[@]}" "${rb[@]}" --thresholds "$D/optimiser.depth_thresholds.tsv" \
+    --chrom-class "$D/optimiser.chrom_class.tsv" --fai "$D/ref.fa.fai" --base-mask "$D/optimiser.mask.bed" \
+    --mode per-sample --bound-method relative --out "$D/relative" > /dev/null
+# Callable fraction from a run's own masks, per pool and per pair (both pools' masks)
+python3 - "$HERE/../bin" "$D" <<'PYTEST' || fail "per-pool callable fraction from masks"
+import sys, pandas as pd
+sys.path.insert(0, sys.argv[1])
+from grenedalf_optimiser import mask_callable
+d = sys.argv[2]
+open(f"{d}/mc_total.bed", "w").write("c\t0\t10\n")
+open(f"{d}/mc_a.bed", "w").write("c\t50\t100\n")
+open(f"{d}/mc_b.bed", "w").write("c\t100\t150\n")
+open(f"{d}/mc_list.tsv", "w").write(f"a\t{d}/mc_a.bed\nb\t{d}/mc_b.bed\n")
+w = pd.DataFrame({"chrom": ["c", "c"], "start": [1, 101], "end": [100, 200]})
+cal = mask_callable(w, f"{d}/mc_total.bed", f"{d}/mc_list.tsv", ["a", "b"], {"c": 200})
+want = {"a": [0.4, 1.0], "b": [0.9, 0.5], "a:b": [0.4, 0.5]}
+for k, v in want.items():
+    assert [round(x, 3) for x in cal[k]] == v, (k, list(cal[k]), v)
+PYTEST
+
 # --- checks
 reasons=$(cut -f4 "$D/optimiser.mask_reasons.bed" | tr ',' '\n' | sort -u | tr '\n' ' ')
 for want in excluded gap softmask low_mappability collapsed ambiguous; do
@@ -166,6 +189,12 @@ awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 && $1=="poolB_L3" && $h["po
 awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 && !($h["fit_lower"] < $h["median"] && $h["median"] < $h["fit_upper"]) {bad=1} END {exit bad}' \
     "$D/optimiser.depth_thresholds.tsv" || fail "fitted bounds do not bracket the median"
 grep -q "BOUND_METHOD=fitted" "$D/fitted.depthmask.params" || fail "fitted bound method not recorded"
+# Relative bounds: poolB's deletion (chr2:150-155 kb) masked in poolB only
+grep -q "BOUND_METHOD=relative" "$D/relative.depthmask.params" || fail "relative bound method not recorded"
+awk -F'\t' '$1=="sim_chr2" && $2<=151000 && $3>=154000' "$D/relative.poolB_L3.depth_mask.bed" | grep -q . \
+    || fail "relative bounds: poolB deletion not masked in poolB"
+awk -F'\t' '$1=="sim_chr2" && $2<154000 && $3>151000 {s=($2>151000?$2:151000); e=($3<154000?$3:154000); n+=e-s}
+    END {exit !(n < 1500)}' "$D/relative.poolA_L3.depth_mask.bed" || fail "relative bounds: poolB deletion masked in poolA"
 ! cmp -s "$D/fitted.total_mask.bed" "$D/optimiser.total_mask.bed" || fail "fitted bounds gave the same mask as fold bounds"
 
 # Nothing named: every contig autosomal, one nuclear run, no X or mito run

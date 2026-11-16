@@ -68,6 +68,7 @@ BASEQ=30
 MIN_FOLD=0.5
 MAX_FOLD=2.0
 ABS_MIN_DEPTH=10
+REL_FLOOR_FOLD=0.25   # relative bounds: the absolute lower bound per base (x median, at least ABS_MIN_DEPTH)
 GRID_MIN_FOLDS=0.33,0.67
 GRID_MAX_FOLDS=1.5,3.0
 GRID_SMOOTH=100       # depth judged on blocks of this many bp in the smoothed_masks grid run
@@ -426,7 +427,7 @@ step_thresholds() {
     done
     "${OPTIMISER[@]}" thresholds "${a[@]}" --mask-summary "$P.mask_summary.tsv" --x-chroms "$SEX_CHROMS" \
         --min-fold "$MIN_FOLD" --max-fold "$MAX_FOLD" --abs-min-depth "$ABS_MIN_DEPTH" \
-        --grid-min-folds "$GRID_MIN_FOLDS" --grid-max-folds "$GRID_MAX_FOLDS" \
+        --grid-min-folds "$GRID_MIN_FOLDS,$REL_FLOOR_FOLD" --grid-max-folds "$GRID_MAX_FOLDS" \
         --base-qual "$BASEQ" --map-qual "$MAPQ" --pool-sizes "$POOL_SPEC" --out "$P"
 }
 
@@ -470,10 +471,12 @@ step_quantize() {
 # depthmask PREFIX MIN_FOLD MAX_FOLD MODE BASE_MASK [BOUND_METHOD] [SMOOTH]
 depthmask() {
     local a=()
-    for n in "${NAMES[@]}"; do a+=(--quantized "$n" "$OUT/quantize/$n.quantized.bed.gz"); done
+    for n in "${NAMES[@]}"; do
+        a+=(--quantized "$n" "$OUT/quantize/$n.quantized.bed.gz" --bins "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz")
+    done
     "${OPTIMISER[@]}" depthmask "${a[@]}" --thresholds "$P.depth_thresholds.tsv" --chrom-class "$P.chrom_class.tsv" \
         --fai "$FAI" --base-mask "$5" --min-fold "$2" --max-fold "$3" --mode "$4" --bound-method "${6:-fold}" \
-        --smooth "${7:-0}" --out "$1"
+        --floor-fold "$REL_FLOOR_FOLD" --smooth "${7:-0}" --out "$1"
 }
 
 step_depthmask() {
@@ -536,7 +539,11 @@ grid_assess() {
     while IFS=$'\t' read -r r _; do
         [[ $r == run ]] && continue
         a+=(--run "$r" "$g/$r/diversity.csv" "$g/$r/fst.csv")
+        # the run's own masks, so each pool's callable fraction is its own
+        # shellcheck disable=SC2046 source=/dev/null
+        a+=(--masks "$r" $(source "$g/$r/mask.depthmask.params"; echo "$TOTAL_MASK_BED ${SAMPLE_MASK_LIST:--}"))
     done < "$g/runs.tsv"
+    a+=(--fai "$FAI")
     [[ ${#a[@]} -gt 0 ]] || { echo "every grid run failed: see $g/failed_runs.tsv" >&2; exit 1; }
     for n in "${NAMES[@]}"; do a+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz"); done
     "${OPTIMISER[@]}" assess "${a[@]}" --reference default --check-run no_accessibility_mask \
@@ -570,6 +577,10 @@ step_grid() {
     runs+=("fitted_bounds $mc $MIN_FOLD $MAX_FOLD shared $m fitted 0 method")
     runs+=("per_sample_masks $mc $MIN_FOLD $MAX_FOLD per-sample $m fold 0 mode")
     runs+=("fitted_bounds_per_sample $mc $MIN_FOLD $MAX_FOLD per-sample $m fitted 0 method+mode")
+    # lower bound relative to the other pools: a pool is masked where it is low against the
+    # rest, not where every pool is low (shared low depth: divergent, often diverse regions)
+    runs+=("relative_bounds $mc $MIN_FOLD $MAX_FOLD shared $m relative 0 method")
+    runs+=("relative_bounds_per_sample $mc $MIN_FOLD $MAX_FOLD per-sample $m relative 0 method+mode")
     # depth judged on blocks, so single bases near a bound do not drop sites
     if [[ ${GRID_SMOOTH:-0} -gt 0 ]]; then
         runs+=("smoothed_masks $mc $MIN_FOLD $MAX_FOLD shared $m fold $GRID_SMOOTH smooth")

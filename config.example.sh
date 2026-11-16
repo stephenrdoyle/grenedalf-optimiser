@@ -33,6 +33,8 @@ BIN=1000             # mosdepth bin size for the consensus depth mask
 MIN_FOLD=0.5
 MAX_FOLD=2.0
 ABS_MIN_DEPTH=10
+REL_FLOOR_FOLD=0.25   # relative_bounds grid runs: absolute lower bound per base (x median); the lower bound
+                      # proper is MIN_FOLD x the other pools' depth, so low depth shared by all pools is kept
 GRID_MIN_FOLDS=0.33,0.67
 GRID_MAX_FOLDS=1.5,3.0
 GRID_SMOOTH=100      # a grid run judging depth on 100 bp blocks instead of single bases (0 = skip)

@@ -621,6 +621,29 @@ def smooth_mask(iv, lengths, width):
     return merge_intervals(pd.concat(out, ignore_index=True))
 
 
+def relative_low_bins(bins, classes, fold):
+    """Per pool, the depth bins where it is low against the other pools: its depth (relative
+    to its chromosome median) below `fold` x the median over all pools of that. Low depth
+    shared by every pool (reference divergence: often the most diverse regions) is not
+    flagged; one pool sampled less than the rest is."""
+    norm = {}
+    for name, path in bins or []:
+        b = read_mosdepth_bins(path, "d")
+        b = b[b["chrom"].isin(classes)].reset_index(drop=True)
+        b["n"] = normalise_by_chrom(b, "d")
+        norm[name] = b.set_index(["chrom", "start", "end"])["n"]
+    if not norm:
+        return {}
+    df = pd.DataFrame(norm)
+    consensus = df.median(axis=1)
+    out = {}
+    for name in df:
+        low = df[name] < fold * consensus
+        iv = df.index[low.to_numpy() & (consensus > 0).to_numpy()].to_frame(index=False)
+        out[name] = merge_intervals(iv) if len(iv) else iv[["chrom", "start", "end"]]
+    return out
+
+
 def cmd_depthmask(args):
     thr = pd.read_csv(args.thresholds, sep="\t")
     classes = dict(pd.read_csv(args.chrom_class, sep="\t", dtype={"chrom": str}).itertuples(index=False))
@@ -631,6 +654,8 @@ def cmd_depthmask(args):
     genome_bp = int(fai.loc[fai["chrom"].isin(classes), "length"].sum())
     accessible_bp = genome_bp - bp(base[base["chrom"].isin(classes)])
 
+    relative = relative_low_bins(args.bins, classes, args.min_fold) if args.bound_method == "relative" else {}
+
     per_pool, rows = {}, []
     for name, path in args.quantized:
         t = thr[thr["pool"] == name].set_index("class")
@@ -639,7 +664,10 @@ def cmd_depthmask(args):
         if args.bound_method == "fitted":
             bounds = {cls: (int(r["fit_lower"]), int(r["fit_upper"])) for cls, r in t.iterrows()}
         else:
-            bounds = {cls: depth_bounds(r["median"], args.min_fold, args.max_fold, int(r["abs_min_depth"]))
+            # relative: per base, only an absolute floor; the lower bound proper is the bin
+            # mask against the other pools
+            low_fold = args.floor_fold if args.bound_method == "relative" else args.min_fold
+            bounds = {cls: depth_bounds(r["median"], low_fold, args.max_fold, int(r["abs_min_depth"]))
                       for cls, r in t.iterrows()}
         q = pd.read_csv(path, sep="\t", header=None, names=["chrom", "start", "end", "label"],
                         dtype={"chrom": str, "start": np.int64, "end": np.int64, "label": str})
@@ -656,6 +684,10 @@ def cmd_depthmask(args):
             log(f"warning: {name}: {int(straddle.sum())} quantize bins straddle a bound and are masked; "
                 "rerun the quantize step with the cut points from the thresholds step")
         out = merge_intervals(q.loc[~inside, ["chrom", "start", "end"]])
+        if args.bound_method == "relative":
+            if name not in relative:
+                sys.exit(f"--bound-method relative needs --bins for every pool ({name} missing)")
+            out = merge_intervals(pd.concat([out, relative[name]], ignore_index=True))
         if args.smooth > 0:
             out = smooth_mask(out, dict(zip(fai["chrom"], fai["length"])), args.smooth)
         per_pool[name] = out
@@ -671,6 +703,7 @@ def cmd_depthmask(args):
     lowers = [v for r in rows for k, v in r.items() if k.startswith("lower_")]
     uppers = [v for r in rows for k, v in r.items() if k.startswith("upper_")]
     params = {"MIN_FOLD": args.min_fold, "MAX_FOLD": args.max_fold, "MASK_MODE": args.mode,
+              "FLOOR_FOLD": args.floor_fold if args.bound_method == "relative" else "",
               "BOUND_METHOD": args.bound_method, "SMOOTH": args.smooth,
               "MIN_DEPTH": min(lowers), "MAX_DEPTH": max(uppers)}
     if args.mode == "shared":
@@ -1410,6 +1443,54 @@ def window_depth(windows, bins, col):
     return out
 
 
+def mask_callable(windows, total_bed, sample_list, pools, lengths):
+    """Callable fraction of each window for each pool, and for each pair of pools (sites both
+    can use), from the run's own masks: the total mask plus that pool's sample mask.
+
+    grenedalf's total.* columns count a site as callable if any pool can use it, so with
+    per-pool masks they overstate every pool's own callable fraction; correlating a pool's
+    theta with them would understate how much it depends on what its mask removed."""
+    total = merge_intervals(read_bed(total_bed))
+    sample = {}
+    if sample_list and sample_list != "-":
+        for name, path in pd.read_csv(sample_list, sep="\t", header=None, dtype=str).itertuples(index=False):
+            sample[name] = merge_intervals(read_bed(path))
+    pools = list(pools)
+    dtype = np.uint8 if len(pools) <= 8 else np.uint16 if len(pools) <= 16 else np.uint64
+    keys = pools + [f"{a}:{b}" for i, a in enumerate(pools) for b in pools[i + 1:]]
+    out = {k: np.full(len(windows), np.nan) for k in keys}
+    for chrom, idx in windows.groupby("chrom").indices.items():
+        L = int(lengths.get(chrom, windows.iloc[idx]["end"].max()))
+        bits = np.zeros(L, dtype)   # bit i set: masked for pool i
+        for i, name in enumerate([None] + pools):
+            iv = total if name is None else sample.get(name)
+            if iv is None:
+                continue
+            g = iv[iv["chrom"] == chrom]
+            if g.empty:
+                continue
+            diff = np.zeros(L + 1, np.int8)   # merged: starts and ends are distinct
+            diff[g["start"].clip(0, L).to_numpy()] = 1
+            diff[g["end"].clip(0, L).to_numpy()] -= 1
+            cov = np.cumsum(diff[:L], dtype=np.int8) > 0
+            bits[cov] |= dtype((1 << len(pools)) - 1) if name is None else dtype(1 << (i - 1))
+        w = windows.iloc[idx]
+        s = (w["start"].to_numpy() - 1).clip(0, L)
+        e = w["end"].to_numpy().clip(0, L)
+        bounds = np.unique(np.concatenate(([0], s, e)))
+        bounds = bounds[bounds < L]
+        width = np.maximum(e - s, 1)
+        for k in keys:
+            sel = sum(1 << pools.index(p) for p in k.split(":"))
+            per_seg = np.add.reduceat((bits & dtype(sel)) != 0, bounds)
+            cs = np.concatenate(([0], np.cumsum(per_seg)))
+            pos = lambda x: np.searchsorted(bounds, x)
+            # masked bases in [s, e): segments start at bounds, so prefix at a bound is exact
+            masked = np.where(e >= L, cs[-1], cs[np.minimum(pos(e), len(cs) - 1)]) - cs[pos(s)]
+            out[k][idx] = 1 - masked / width
+    return out
+
+
 def spearman(a, b):
     m = np.isfinite(a) & np.isfinite(b)
     if m.sum() < 10:
@@ -1432,6 +1513,9 @@ def cmd_assess(args):
         b = read_mosdepth_bins(path, "depth")
         b["norm"] = normalise_by_chrom(b, "depth")
         depth[name] = b
+    masks = {r: (tot, sl) for r, tot, sl in args.masks or []}
+    fai = read_fai(args.fai) if args.fai else None
+    lengths = dict(zip(fai["chrom"], fai["length"])) if fai is not None else {}
 
     run_rows, stat_rows = [], []
     for run, *tables in args.run:
@@ -1458,13 +1542,19 @@ def cmd_assess(args):
         with np.errstate(invalid="ignore", divide="ignore"):
             all_mean = np.vstack(list(wdepth.values())).mean(axis=0) if wdepth else None
         stats = [c for c in t.columns if c.endswith(STAT_SUFFIXES)]
+        # Callable fraction per pool and per pair from the run's masks; without them, the
+        # all-pool fraction (the same thing when every pool has the same mask)
+        own_callable = {}
+        if run in masks:
+            pools = sorted({p for c in stats for p in c.rsplit(".", 1)[0].split(":")})
+            own_callable = mask_callable(t, *masks[run], pools, lengths)
 
         for col in stats:
             x = t[col].to_numpy(dtype=float)
+            sample = col.rsplit(".", 1)[0]
             row = {"run": run, "stat": col, "type": col.rsplit(".", 1)[1], "n_windows": int(np.isfinite(x).sum()),
                    "median": float(np.nanmedian(x)) if np.isfinite(x).any() else np.nan,
-                   "rho_callable": spearman(x, t["callable"].to_numpy())}
-            sample = col.rsplit(".", 1)[0]
+                   "rho_callable": spearman(x, own_callable.get(sample, t["callable"].to_numpy()))}
             pools = sample.split(":")
             if all(p in wdepth for p in pools):
                 d = np.vstack([wdepth[p] for p in pools])
@@ -1602,9 +1692,14 @@ def cmd_combine(args):
             for f in fields:
                 combo[f] = best[f]
             chosen.append(best["run"])
-    if combo["method"] == "fitted":   # fitted bounds replace the folds
-        combo["min_fold"], combo["max_fold"] = base["min_fold"], base["max_fold"]
-        fold_runs = set(m.loc[m["setting"].isin(["lower", "upper"]), "run"])
+    # fitted bounds replace both folds; relative bounds replace the lower one (min_fold is then
+    # the fold against the other pools, kept at the default)
+    replaced = {"fitted": ["lower", "upper"], "relative": ["lower"]}.get(combo["method"], [])
+    if replaced:
+        fold_runs = set(m.loc[m["setting"].isin(replaced), "run"])
+        for setting, field in (("lower", "min_fold"), ("upper", "max_fold")):
+            if setting in replaced:
+                combo[field] = base[field]
         chosen = [c for c in chosen if c not in fold_runs]
     fields = ["mc", "min_fold", "max_fold", "mode", "base", "method", "smooth"]
     same = (m[fields].astype(str) == combo[fields].astype(str)).all(axis=1)
@@ -1682,9 +1777,15 @@ def main():
     p.add_argument("--base-mask", help="accessibility mask to combine with")
     p.add_argument("--min-fold", type=float, default=0.5)
     p.add_argument("--max-fold", type=float, default=2.0)
-    p.add_argument("--bound-method", choices=["fold", "fitted"], default="fold",
+    p.add_argument("--bound-method", choices=["fold", "fitted", "relative"], default="fold",
                    help="fold: fold x median; fitted: quantiles of a negative binomial fitted to each pool's "
-                        "coverage (bounds follow the pool's actual spread) [fold]")
+                        "coverage (bounds follow the pool's actual spread); relative: lower bound against the "
+                        "other pools (--min-fold x their median, in --bins), with --floor-fold x median per base "
+                        "[fold]")
+    p.add_argument("--bins", nargs=2, action="append", metavar=("POOL", "MQX_BINS"),
+                   help="mosdepth bins at the MAPQ cut-off, for --bound-method relative; repeat per pool")
+    p.add_argument("--floor-fold", type=float, default=0.25,
+                   help="relative bounds: absolute lower bound per base, x the pool's median [0.25]")
     p.add_argument("--mode", choices=["shared", "per-sample"], default="shared",
                    help="shared: one mask, every pool called at the same sites; "
                         "per-sample: one mask per pool (more sites, uneven missingness) [shared]")
@@ -1797,6 +1898,10 @@ def main():
                    help="run name, then its grenedalf diversity and/or fst tables; repeat per run")
     p.add_argument("--depth", nargs=2, action="append", metavar=("POOL", "MQX_BINS"),
                    help="mosdepth bins at the MAPQ cut-off, named as the grenedalf samples")
+    p.add_argument("--masks", nargs=3, action="append", metavar=("NAME", "TOTAL_BED", "SAMPLE_LIST"),
+                   help="a run's total mask and per-sample mask list (- for none), so the callable fraction is "
+                        "each pool's (or pair's) own; repeat per run (default: grenedalf's all-pool count)")
+    p.add_argument("--fai", help="reference .fai (chromosome lengths, with --masks)")
     p.add_argument("--min-snps", type=int, default=50, help="windows with fewer SNPs are not scored [50]")
     p.add_argument("--reference", "--strict", dest="reference",
                    help="reference run, normally the default settings (default: the first run)")

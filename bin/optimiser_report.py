@@ -344,6 +344,10 @@ def section_summary(P, out_dir):
     modes = {t: read_params(run_file(out_dir, r, "mask.depthmask.params") or "").get("MASK_MODE", "shared")
              for t, r in runs.items()}
     dm = dms["fst"] if dms["fst"] is not None else read_tsv(f"{P}.depthmask_summary.tsv")
+    dmp = {}
+    for t, r in runs.items():
+        f = run_file(out_dir, r, "mask.depthmask.params")
+        dmp[t] = read_params(f) if f and os.path.exists(f) else {}
     tiles = []
     if mask is not None:
         tot = mask[mask["chrom"] == "total"].iloc[0]
@@ -383,19 +387,21 @@ def section_summary(P, out_dir):
             r = {"pool": pool}
             if "pool_size" in g:
                 r["pool size"] = int(g["pool_size"].iloc[0])
-            def kept(d, c):
+            def kept(d, c, t="fst"):
                 ch = d.set_index("pool").loc[pool] if d is not None and pool in set(d["pool"]) else None
                 lo, hi = g.loc[c, "lower"], g.loc[c, "upper"]
                 if ch is not None and pd.notna(ch.get(f"lower_{c}", np.nan)):
                     lo, hi = int(ch[f"lower_{c}"]), int(ch[f"upper_{c}"])
-                return f"{lo}–{hi}×"
+                rel = (f", not below {dmp[t].get('MIN_FOLD')}× the other pools"
+                       if dmp.get(t, {}).get("BOUND_METHOD") == "relative" else "")
+                return f"{lo}–{hi}×{rel}"
             for c, lab in (("A", "autosomes"), ("X", "X")):
                 if c in g.index:
                     r[f"{lab}: median"] = f"{g.loc[c, 'median']}×"
                     r[f"{lab}: kept"] = kept(dm, c)
-                    if dms["diversity"] is not None and kept(dms["diversity"], c) != r[f"{lab}: kept"]:
+                    if dms["diversity"] is not None and kept(dms["diversity"], c, "diversity") != r[f"{lab}: kept"]:
                         r[f"{lab}: kept"] += " (FST)"
-                        r[f"{lab}: kept (diversity)"] = kept(dms["diversity"], c)
+                        r[f"{lab}: kept (diversity)"] = kept(dms["diversity"], c, "diversity")
             if "n_eff_at_median" in g and "A" in g.index:
                 r["n_eff (autosomes)"] = g.loc["A", "n_eff_at_median"]
             rows.append(r)
@@ -784,15 +790,21 @@ def section_min_count(P):
         return ""
     cols = [c for c in mc.columns if c.startswith("err_sites_per_Mb_c")]
     t = mc[["pool", "median_depth"] + cols + ["min_count"]].copy()
-    t.columns = ["pool", "median depth"] + [f"≥{c.rsplit('c', 1)[1]}" for c in cols] + ["chosen"]
+    t.columns = ["pool", "median depth"] + [f"≥{c.rsplit('c', 1)[1]}" for c in cols] + ["error model"]
     vcols = [c for c in t.columns if c.startswith("≥")]
-    chosen = dict(zip(t["pool"], t["chosen"]))
+    chosen = dict(zip(t["pool"], t["error model"]))
     log1p = lambda v: math.log10(1 + v)
+    mp = read_params(os.path.join(os.path.dirname(P), "params.sh"))
+    d, f = mp.get("DIVERSITY_MIN_COUNT"), mp.get("FST_MIN_COUNT", mp.get("MIN_COUNT"))
+    used = (f"{d} for diversity and {f} for FST" if d and f and d != f else (f or d))
+    used_txt = (f" The count used is <strong>{used}</strong>: the error model's count is where the default "
+                "run starts, and the filter grid tries one count below and one above it." if used else "")
     return ("<section><h2>Minimum allele count</h2>"
             f"<p>Expected sites per Mb where sequencing errors alone give at least <em>c</em> reads of one "
             f"non-reference base, at each pool's median depth and the error rate implied by the base-quality "
             f"cut-off ({mc['error_rate'].iloc[0]:g}); shading is on a log scale. The outlined count is the smallest "
-            f"that keeps this below the accepted rate; the run uses the largest across pools.</p>"
+            f"that keeps this below the accepted rate, and the largest across pools is the error model's count."
+            f"{used_txt}</p>"
             + heat_table(t, vcols, lambda v: compact(round(v)) if v >= 10 else (f"{v:.1f}" if v >= 0.1 else
                                                  ("0" if v == 0 else "<0.1")), scale=log1p,
                          vmax=log1p(float(t[vcols].max().max())),
@@ -1061,7 +1073,7 @@ def section_grid(P):
     ref_run = assess.get("REFERENCE_RUN", "")
     judged = [c for c in assess.get("JUDGED_COVARIATES", "").split(",") if c]
     cov_label = {"rho_rel_depth": "depth relative to the other pools", "rho_depth_imbalance": "depth imbalance",
-                 "rho_callable": "callable fraction", "rho_depth": "depth"}
+                 "rho_callable": "callable fraction (each pool's own; for a pair, sites both can use)", "rho_depth": "depth"}
     metric_label = {"pair_snps": "SNPs usable per pair of pools (mean over pairs)",
                     "pool_snps": "SNPs usable per pool (mean over pools)", "snps": "SNPs"}
     role = runs["role"] if "role" in runs else pd.Series("candidate", index=runs.index)
