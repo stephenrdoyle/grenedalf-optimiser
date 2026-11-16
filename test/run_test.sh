@@ -49,7 +49,7 @@ r=()
 for p in "${POOLS[@]}"; do r+=(--depth "$p" "$D/$p.mq30.regions.bed.gz"); done
 "${OPTIMISER[@]}" assess --run clean "$D/clean.diversity.csv" "$D/clean.fst.csv" \
     --run artefact "$D/artefact.diversity.csv" "$D/artefact.fst.csv" "${r[@]}" \
-    --strict clean --min-snps 20 --out "$D/optimiser"
+    --reference clean --min-snps 20 --out "$D/optimiser"
 
 v=()
 for p in "${POOLS[@]}"; do v+=(--depth "$p" "$D/$p.mq30.regions.bed.gz" --dist "$p" "$D/$p.mosdepth.region.dist.txt"); done
@@ -59,8 +59,13 @@ for p in "${POOLS[@]}"; do v+=(--depth "$p" "$D/$p.mq30.regions.bed.gz" --dist "
     --fai "$D/ref.fa.fai" --base-mask "$D/optimiser.mask.bed" --mode shared --bound-method fitted --out "$D/fitted" > /dev/null
 
 "${OPTIMISER[@]}" commands --prefix "$D/optimiser" --out-dir "$D" --fai "$D/ref.fa.fai" \
-    --bam "${POOLS[@]/%/.bam}" --x-chroms sim_chrX --total-mask "$D/optimiser.total_mask.bed" --pool-size-arg 400 \
-    --min-count 3 --min-depth 10 --max-depth 282 --window 6000 --stride 3000 --min-snps 50
+    --bam "${POOLS[@]/%/.bam}" --x-chroms sim_chrX --pool-size-arg 400 \
+    --settings diversity "$D/persample.total_mask.bed" "$D/persample.sample_masks.tsv" 2 10 282 \
+    --settings fst "$D/optimiser.total_mask.bed" - 3 10 282 \
+    --window 6000 --stride 3000 --min-snps 50
+# Smoothed depth masks: whole 100 bp blocks only
+"${OPTIMISER[@]}" depthmask "${q[@]}" --thresholds "$D/optimiser.depth_thresholds.tsv" --chrom-class "$D/optimiser.chrom_class.tsv" \
+    --fai "$D/ref.fa.fai" --mode per-sample --smooth 100 --out "$D/smooth" > /dev/null
 
 # --- checks
 reasons=$(cut -f4 "$D/optimiser.mask_reasons.bed" | tr ',' '\n' | sort -u | tr '\n' ' ')
@@ -74,9 +79,29 @@ grep -q $'^sim_chr2\t150000\t155000' "$D/optimiser.mask.bed" && fail "pool-speci
 awk -F'\t' 'NR>1 && $1=="poolA_L3" && $2=="X" && $4 >= 26 && $4 <= 34 {ok=1} END {exit !ok}' "$D/optimiser.depth_thresholds.tsv" \
     || fail "poolA X median not ~30 (0.75 x 40)"
 grep -q "OK: grenedalf masked" "$D/optimiser.windows.txt" || fail "mask orientation check"
-grep -q "RECOMMENDED_RUN=clean" "$D/optimiser.assess.params" || fail "assess should prefer the clean run"
-awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 && $1=="artefact" {exit !($h["max_increase"] > 0.2)}' \
-    "$D/optimiser.assess_runs.tsv" || fail "artefact run not scored worse than the clean run"
+for t in DIVERSITY FST; do
+    grep -q "RECOMMENDED_RUN_$t=clean" "$D/optimiser.assess.params" || fail "assess should prefer the clean run for $t"
+done
+for t in diversity fst; do
+    awk -F'\t' -v t="$t" 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 && $1=="artefact" {exit !($h["max_increase_" t] > 0.1)}' \
+        "$D/optimiser.assess_runs.tsv" || fail "artefact run not scored worse than the clean run for $t"
+done
+awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 {exit !($h["data_metric_diversity"]=="pool_snps" && $h["data_metric_fst"]=="pair_snps")}' \
+    "$D/optimiser.assess_runs.tsv" || fail "data kept not per pool for diversity and per pair for fst"
+# Different settings for diversity and fst reach their own commands
+grep -A20 "grenedalf diversity" "$D/grenedalf_commands.sh" | grep -m1 -- "--filter-sample-min-count" | grep -q "count 2" \
+    || fail "diversity command without its own min count"
+grep -A20 "grenedalf fst" "$D/grenedalf_commands.sh" | grep -m1 -- "--filter-sample-min-count" | grep -q "count 3" \
+    || fail "fst command without its own min count"
+grep -A20 "grenedalf diversity" "$D/grenedalf_commands.sh" | grep -m1 -- "--filter-mask-samples-bed-list" | grep -q "persample" \
+    || fail "diversity command without its per-pool masks"
+awk '/^grenedalf fst/ {n++} n == 1' "$D/grenedalf_commands.sh" | awk '/file-prefix/ {print; exit} 1' \
+    | grep -q -- "--filter-mask-samples-bed-list" && fail "autosome fst command given the diversity per-pool masks"
+# (apart from the one-base pad at each chromosome end that every mask carries)
+awk -F'\t' '($2 % 100) && $3 - $2 > 1 {bad=1} END {exit bad}' "$D/smooth.poolA_L3.depth_mask.bed" \
+    || fail "smoothed mask not in 100 bp blocks"
+[[ $(wc -l < "$D/smooth.poolA_L3.depth_mask.bed") -lt $(wc -l < "$D/persample.poolA_L3.depth_mask.bed") ]] \
+    || fail "smoothing did not simplify the depth mask"
 [[ $(wc -l < "$D/persample.sample_masks.tsv") -eq 6 ]] || fail "per-sample mask list"
 # Simulated LD scale is 2 kb (correlation exp(-d/2000)): r2 excess should be gone by a few kb
 source "$D/optimiser.ld.params"
@@ -149,8 +174,9 @@ grep -q "BOUND_METHOD=fitted" "$D/fitted.depthmask.params" || fail "fitted bound
 [[ $(awk -F'\t' 'NR>1 && $2!="A"' "$D/unnamed.chrom_classes.tsv" | wc -l) -eq 0 ]] || fail "unnamed contigs not all autosomal"
 mkdir -p "$D/unnamed_cmds"
 "${OPTIMISER[@]}" commands --prefix "$D/unnamed" --out-dir "$D/unnamed_cmds" --fai "$D/ref.fa.fai" \
-    --bam "${POOLS[@]/%/.bam}" --total-mask "$D/optimiser.total_mask.bed" --pool-size-arg 400 \
-    --min-count 2 --min-depth 10 --max-depth 282 --window 6000 --stride 3000 > /dev/null
+    --bam "${POOLS[@]/%/.bam}" --pool-size-arg 400 \
+    --settings diversity "$D/optimiser.total_mask.bed" - 2 10 282 --settings fst "$D/optimiser.total_mask.bed" - 2 10 282 \
+    --window 6000 --stride 3000 > /dev/null
 grep -q -- "--out-dir \$OUTDIR/nuclear " "$D/unnamed_cmds/grenedalf_commands.sh" || fail "no single nuclear run when nothing is named"
 ! grep -q -- "--out-dir \$OUTDIR/\(X\|mito\) " "$D/unnamed_cmds/grenedalf_commands.sh" || fail "X or mito run without named contigs"
 

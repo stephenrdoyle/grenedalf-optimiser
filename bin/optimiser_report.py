@@ -316,15 +316,34 @@ def tile(label, value, note=""):
 
 # ---------------------------------------------------------------------------
 
+TARGETS = {"diversity": "diversity (θπ, θW per pool)", "fst": "FST (per pair of pools)"}
+TARGET_TYPES = {"diversity": ("theta_pi", "theta_watterson"), "fst": ("fst",)}
+
+
+def chosen_runs(P):
+    """Grid run chosen for diversity and for FST (older outputs: one run for both)."""
+    a = read_params(f"{P}.assess.params")
+    fst = a.get("RECOMMENDED_RUN_FST") or a.get("RECOMMENDED_RUN")
+    return {"diversity": a.get("RECOMMENDED_RUN_DIVERSITY") or fst, "fst": fst}
+
+
+def run_file(out_dir, run, name):
+    path = os.path.join(out_dir, "grid", run, name) if run and out_dir else None
+    return path if path and os.path.exists(path) else None
+
+
 def section_summary(P, out_dir):
     params = read_params(os.path.join(out_dir, "params.sh")) if out_dir else {}
     win = read_params(f"{P}.windows.params")
     ld = read_params(f"{P}.ld.params")
     mask = read_tsv(f"{P}.mask_summary.tsv", dtype={"chrom": str})
-    # The grid may choose different depth folds or mask mode: report the chosen run's masks
-    run = read_params(f"{P}.assess.params").get("RECOMMENDED_RUN")
-    run_dm = os.path.join(out_dir, "grid", run, "mask.depthmask_summary.tsv") if run and out_dir else None
-    dm = read_tsv(run_dm) if run_dm and os.path.exists(run_dm) else read_tsv(f"{P}.depthmask_summary.tsv")
+    # The grid may choose different depth folds, mask mode or minimum count for diversity and
+    # FST: report the chosen runs' masks
+    runs = chosen_runs(P)
+    dms = {t: read_tsv(run_file(out_dir, r, "mask.depthmask_summary.tsv")) for t, r in runs.items()}
+    modes = {t: read_params(run_file(out_dir, r, "mask.depthmask.params") or "").get("MASK_MODE", "shared")
+             for t, r in runs.items()}
+    dm = dms["fst"] if dms["fst"] is not None else read_tsv(f"{P}.depthmask_summary.tsv")
     tiles = []
     if mask is not None:
         tot = mask[mask["chrom"] == "total"].iloc[0]
@@ -336,16 +355,24 @@ def section_summary(P, out_dir):
     if dm is not None and (dm["pool"] == "shared").any():
         s = dm[dm["pool"] == "shared"].iloc[0]
         tiles.append(tile("Callable in every pool", pct(1 - s["out_of_range_frac"]),
-                          "of the accessible genome, after depth bounds"))
-    mc = params.get("MIN_COUNT") or read_params(f"{P}.thresholds.params").get("MIN_COUNT")
-    if mc:
-        tiles.append(tile("Minimum allele count", mc, "reads supporting an allele"))
+                          "of the accessible genome, after the FST run's depth bounds"))
+    mc_d, mc_f = params.get("DIVERSITY_MIN_COUNT"), params.get("FST_MIN_COUNT")
+    if mc_d and mc_f and mc_d != mc_f:
+        tiles.append(tile("Minimum allele count", f"{mc_d} / {mc_f}", "diversity / FST"))
+    else:
+        mc = mc_f or params.get("MIN_COUNT") or read_params(f"{P}.thresholds.params").get("MIN_COUNT")
+        if mc:
+            tiles.append(tile("Minimum allele count", mc, "reads supporting an allele"))
     if win:
         tiles.append(tile("Window", bp(win['WINDOW']), f"stride {bp(win['STRIDE'])}"))
     if ld.get("LD_D10", "NA") != "NA":
         tiles.append(tile("Linkage scale", bp(ld['LD_D10']), f"90% decay; half at {bp(ld['LD_D50'])}"))
-    if run:
-        tiles.append(tile("Grid choice", run.replace("_", " "), "most data without any statistic getting worse"))
+    if runs["fst"] and runs["diversity"] == runs["fst"]:
+        tiles.append(tile("Grid choice", runs["fst"].replace("_", " "), "for diversity and FST"))
+    else:
+        for t, lab in (("diversity", "Diversity settings"), ("fst", "FST settings")):
+            if runs[t]:
+                tiles.append(tile(lab, runs[t].replace("_", " "), "grid run, chosen for these statistics"))
     body = f'<div class="tiles">{"".join(tiles)}</div>'
 
     thr = read_tsv(f"{P}.depth_thresholds.tsv")
@@ -356,21 +383,28 @@ def section_summary(P, out_dir):
             r = {"pool": pool}
             if "pool_size" in g:
                 r["pool size"] = int(g["pool_size"].iloc[0])
-            chosen = dm.set_index("pool").loc[pool] if dm is not None and pool in set(dm["pool"]) else None
+            def kept(d, c):
+                ch = d.set_index("pool").loc[pool] if d is not None and pool in set(d["pool"]) else None
+                lo, hi = g.loc[c, "lower"], g.loc[c, "upper"]
+                if ch is not None and pd.notna(ch.get(f"lower_{c}", np.nan)):
+                    lo, hi = int(ch[f"lower_{c}"]), int(ch[f"upper_{c}"])
+                return f"{lo}–{hi}×"
             for c, lab in (("A", "autosomes"), ("X", "X")):
                 if c in g.index:
-                    lo, hi = g.loc[c, "lower"], g.loc[c, "upper"]
-                    if chosen is not None and pd.notna(chosen.get(f"lower_{c}", np.nan)):
-                        lo, hi = int(chosen[f"lower_{c}"]), int(chosen[f"upper_{c}"])
                     r[f"{lab}: median"] = f"{g.loc[c, 'median']}×"
-                    r[f"{lab}: kept"] = f"{lo}–{hi}×"
+                    r[f"{lab}: kept"] = kept(dm, c)
+                    if dms["diversity"] is not None and kept(dms["diversity"], c) != r[f"{lab}: kept"]:
+                        r[f"{lab}: kept"] += " (FST)"
+                        r[f"{lab}: kept (diversity)"] = kept(dms["diversity"], c)
             if "n_eff_at_median" in g and "A" in g.index:
                 r["n_eff (autosomes)"] = g.loc["A", "n_eff_at_median"]
             rows.append(r)
         mp = read_params(os.path.join(out_dir, "params.sh")) if out_dir else {}
+        lo_key = "FST_MIN_DEPTH" if "FST_MIN_DEPTH" in mp else "MIN_DEPTH"
+        hi_key = lo_key.replace("MIN", "MAX")
         glob = (f" grenedalf's own <code>--filter-sample-min-read-depth</code> / <code>--filter-sample-max-read-depth</code> "
-                f"are set to {mp['MIN_DEPTH']} / {mp['MAX_DEPTH']}, wide enough not to undo these."
-                if "MIN_DEPTH" in mp else "")
+                f"are set to {mp[lo_key]} / {mp[hi_key]}, wide enough not to undo these."
+                if lo_key in mp else "")
         cost = ""
         if dm is not None and (dm["pool"] == "shared").any():
             per = dm[dm["pool"] != "shared"]["out_of_range_frac"].astype(float)
@@ -380,10 +414,14 @@ def section_summary(P, out_dir):
                     "largest single pool), because the pools are out of range in different places. Most of that "
                     "is usually low depth; see <em>Where the mask falls</em> for whether it is long blocks in "
                     "single pools (divergent haplotypes, deletions) or scattered.")
+        mode_txt = {"shared": "a site outside any pool's range is masked in every pool, so all pools are called "
+                              "at the same sites",
+                    "per-sample": "a site outside a pool's range is masked in that pool only"}
+        how = "; ".join(f"for {t if t == 'diversity' else 'FST'}, {mode_txt.get(m, m)}" for t, m in modes.items()) \
+            if len(set(modes.values())) > 1 else mode_txt.get(modes["fst"], "")
         body += ("<h3>Depth bounds per pool</h3>"
                  "<p>grenedalf has a single depth filter for all pools, so each pool's own range is applied as a "
-                 "mask: a site outside any pool's range is masked in every pool, so all pools are called at the same "
-                 f"sites.{glob} n_eff is the number of chromosomes effectively sampled at that depth from a pool of "
+                 f"mask: {how}.{glob} n_eff is the number of chromosomes effectively sampled at that depth from a pool of "
                  f"that size; depth well beyond the pool size adds little.{cost}</p>" + plain_table(pd.DataFrame(rows)))
 
     cmd_path = os.path.join(out_dir, "grenedalf_commands.sh") if out_dir else ""
@@ -470,15 +508,35 @@ def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
     reasons_bed = pd.read_csv(f"{P}.mask_reasons.bed", sep="\t", header=None, names=["chrom", "start", "end", "why"],
                               dtype={"chrom": str})
     reasons_bed = reasons_bed[reasons_bed["chrom"].isin(chroms["chrom"])]
-    run = read_params(f"{P}.assess.params").get("RECOMMENDED_RUN")
-    final_path = next((f for f in ([os.path.join(out_dir, "grid", run, "mask.total_mask.bed")] if run and out_dir else [])
-                       + [f"{P}.total_mask.bed"] if os.path.exists(f)), None)
-    final = merge_bed(read_bed3(final_path)) if final_path else None
+    # Final masks of the chosen grid runs: the total mask, plus each pool's own mask when the
+    # run has per-pool masks (shown as the mean over pools)
+    finals = {}
+    for t, r in chosen_runs(P).items():
+        tot = run_file(out_dir, r, "mask.total_mask.bed")
+        if not tot or any(v[0] == r for v in finals.values()):
+            continue
+        sm = run_file(out_dir, r, "mask.sample_masks.tsv")
+        pools = ([merge_bed(read_bed3(f)) for f in pd.read_csv(sm, sep="\t", header=None)[1]] if sm else None)
+        finals[t] = (r, merge_bed(read_bed3(tot)), pools)
+    if not finals and os.path.exists(f"{P}.total_mask.bed"):
+        finals["fst"] = ("", merge_bed(read_bed3(f"{P}.total_mask.bed")), None)
+
+    def final_label(t):
+        what = "diversity and FST" if len(finals) == 1 else ("FST" if t == "fst" else "diversity")
+        return f"final mask, {what}" + (" (pool mean)" if finals[t][2] is not None else "")
+
+    def final_fraction(t, chrom, L, edges):
+        _, total, pools = finals[t]
+        tc = total[total["chrom"] == chrom]
+        if pools is None:
+            return bin_fraction(tc, L, edges)
+        return np.mean([bin_fraction(merge_bed(pd.concat([tc, pm[pm["chrom"] == chrom]])), L, edges)
+                        for pm in pools], axis=0)
 
     rows = [(k, lab) for k, lab in MASK_ROWS if (reasons_bed["why"].str.contains(k)).any()]
     rows.append(("any", "accessibility mask"))
-    if final is not None:
-        rows.append(("final", "final mask (+ depth bounds)"))
+    for t in finals:
+        rows.append((f"final:{t}", final_label(t)))
 
     # Per pool: share of each bin (1 kb mosdepth bins) outside that pool's depth bounds
     pool_bins = {}
@@ -509,7 +567,8 @@ def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
     ml, mr, w = 168, 12, 900
     rowh, gap = 11, 1
     scale = (w - ml - mr) / longest
-    panels = []
+    panels, blocks = [], []
+    block = 5_000_000 if longest > 20e6 else 1_000_000
     for r in chroms.itertuples():
         L = int(r.length)
         edges = np.append(np.arange(0, L, bin_size), L)
@@ -526,10 +585,11 @@ def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
                     fr[k] = np.nan_to_num(np.bincount(idx, weights=wgt * pb["out"].to_numpy(),
                                                       minlength=len(edges) - 1) / tot)
                 continue
+            if k.startswith("final:"):
+                fr[k] = final_fraction(k[6:], r.chrom, L, edges)
+                continue
             if k == "any":
                 iv = sub
-            elif k == "final":
-                iv = final[final["chrom"] == r.chrom]
             else:
                 iv = sub[np.array([k in w.split(",") for w in sub["why"]], dtype=bool)]
             fr[k] = bin_fraction(iv, L, edges)
@@ -541,8 +601,8 @@ def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
             g.append(f'<rect x="{ml}" y="{y}" width="{L * scale:.1f}" height="{rowh}" fill="var(--page)"/>')
             v = fr[k]
             # one rect per run of bins with the same shade (keeps the file small)
-            # shade 0 = nothing masked (not drawn); any masking gets at least the lightest shade
-            steps = np.where(v > 0, np.maximum(np.round(np.clip(v, 0, 1) * (len(SEQ) - 1)), 1), 0).astype(int)
+            # shade proportional to the fraction masked; under 2% is not drawn
+            steps = np.where(v >= 0.02, np.maximum(np.round(np.clip(v, 0, 1) * (len(SEQ) - 1)), 1), 0).astype(int)
             b = 0
             while b < len(v):
                 e = b
@@ -562,8 +622,16 @@ def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
             x = ml + t * 1e6 * scale
             g.append(f'<line class="ax" x1="{x:.1f}" x2="{x:.1f}" y1="{base}" y2="{base + 4}"/>'
                      f'<text class="tick" x="{x:.1f}" y="{base + 15}" text-anchor="middle">{t:g}</text>')
-        masked = float(fr["final"].mean() if "final" in fr else fr["any"].mean())
-        panels.append(f"<h3>{esc(r.chrom)} · {L / 1e6:.1f} Mb · {100 * masked:.1f}% masked</h3>"
+        w_bins = np.diff(edges) / L
+        masked = [f"accessibility mask {100 * float((fr['any'] * w_bins).sum()):.1f}%"]
+        for t in finals:
+            masked.append(f"{final_label(t)} {100 * float((fr['final:' + t] * w_bins).sum()):.1f}%")
+        # final masks in large blocks, for the table below
+        bedges = np.append(np.arange(0, L, block), L)
+        for t in finals:
+            for b0, v in zip(bedges[:-1], final_fraction(t, r.chrom, L, bedges)):
+                blocks.append({"target": t, "chrom": r.chrom, "block": int(b0 // block), "masked": float(v)})
+        panels.append(f"<h3>{esc(r.chrom)} · {L / 1e6:.1f} Mb</h3><p class='sub'>{esc(' · '.join(masked))}</p>"
                       f'<svg viewBox="0 0 {w} {h}" role="img" aria-label="mask along {esc(r.chrom)}">{"".join(g)}</svg>')
     key = "".join(f'<span style="display:inline-block;width:22px;height:10px;background:{c}"></span>'
                   for c in SEQ[1::2])
@@ -571,12 +639,38 @@ def section_karyoplot(P, out_dir, max_chroms=10, max_bins=300):
               f'<span>x axis: Mb</span></div>')
     n_all = int(((summary["chrom"] != "total") & (summary["excluded"] < summary["length"])).sum())
     more = f" The {max_chroms} longest of {n_all} analysed contigs are shown." if n_all > max_chroms else ""
+    region = region_table(pd.DataFrame(blocks), block, {t: final_label(t) for t in finals}) if blocks else ""
     return ("<section><h2>Where the mask falls</h2>"
             "<p>Each chromosome drawn to the same scale, with one row per mask reason, then the whole accessibility "
-            "mask, then the final mask grenedalf uses (accessibility plus every pool's depth bounds), then each "
-            "pool's share of sites outside its own depth bounds (from 1 kb depth bins). Long dark blocks in a single "
-            "pool are regions that pool covers poorly or excessively (divergent haplotypes, deletions, copy-number "
-            f"changes); scattered speckle is noise. Darker = more of the bin; hover for values.{more}</p>" + legend + "".join(panels) + "</section>")
+            "mask, then the final mask grenedalf uses for the chosen grid run (accessibility plus the depth bounds; "
+            "with per-pool masks, the mean over pools of what each pool loses), then each pool's share of sites "
+            "outside its own default depth bounds (from 1 kb depth bins). Long dark blocks in a single pool are "
+            "regions that pool covers poorly or excessively (divergent haplotypes, deletions, copy-number changes); "
+            "dark blocks in every pool are usually reference divergence; scattered speckle is noise. Darker = more "
+            f"of the bin; hover for values.{more}</p>" + legend + "".join(panels) + region + "</section>")
+
+
+def region_table(blocks, block, labels):
+    """Final mask by large block, one row per chromosome: shows a region losing far more than
+    the rest of the genome as a number, not just a shade."""
+    out = []
+    unit = block / 1e6
+    for t, g in blocks.groupby("target", sort=False):
+        wide = g.pivot(index="chrom", columns="block", values="masked").reindex(g["chrom"].unique())
+        cols = [f"{b * unit:g}–{(b + 1) * unit:g}" for b in wide.columns]
+        wide.columns = cols
+        wide = wide.reset_index().rename(columns={"chrom": "chromosome"})
+        med = float(np.nanmedian(g["masked"]))
+        hot = g[g["masked"] > med + 0.15]
+        note = (f" The genome-wide median block is {100 * med:.0f}% masked; "
+                + (f"{len(hot)} block(s) lose more than 15 points over that: "
+                   + ", ".join(f"{h.chrom} {h.block * unit:g}–{(h.block + 1) * unit:g} Mb ({100 * h.masked:.0f}%)"
+                               for h in hot.sort_values("masked", ascending=False).head(8).itertuples())
+                   + ("…" if len(hot) > 8 else "") + "." if len(hot) else "no block loses more than 15 points over that."))
+        out.append(f"<h3>{esc(labels[t][0].upper() + labels[t][1:])}, by {unit:g} Mb block</h3>"
+                   f"<p>Fraction of each block masked (Mb along the chromosome).{esc(note)}</p>"
+                   + heat_table(wide, cols, lambda v: f"{100 * v:.0f}%", vmax=1.0))
+    return "".join(out)
 
 
 def read_bed3(path):
@@ -828,10 +922,20 @@ def section_chromclass(P):
         verdict = ""
         if unreliable:
             src = x["male_fraction_source"].iloc[0] if "male_fraction_source" in x else ""
-            reasons = "; ".join(sorted(set(x.loc[~plaus, "unreliable_because"].dropna().astype(str)))) \
-                if "unreliable_because" in x else ""
+            bad = x.loc[~plaus]
+            why = (bad["unreliable_because"].fillna("").astype(str) if "unreliable_because" in bad
+                   else pd.Series("", index=bad.index))
+            parts = []
+            if why.str.contains("outside").any():
+                parts.append(f"the X / autosome depth ratio is outside 0.5–1 in {int(why.str.contains('outside').sum())} "
+                             f"of {len(x)} pools")
+            sp = bad.loc[why.str.contains("spread"), "spread_ratio"].astype(float) if "spread_ratio" in bad else []
+            if len(sp):
+                rng = f"{sp.min():.1f}×" if round(sp.min(), 1) == round(sp.max(), 1) else f"{sp.min():.1f}–{sp.max():.1f}×"
+                parts.append(f"X and autosome depth spreads differ {rng} ({len(sp)} of {len(x)} pools)")
+            reasons = "; ".join(parts)
             verdict += ('<p class="status">' + ICON_BAD + "X depth does not reflect copy number in this data</p>"
-                        f"<p>{esc(reasons.capitalize()) + '. ' if reasons else ''}A sex ratio can only give X depth "
+                        f"<p>{esc(reasons[:1].upper() + reasons[1:]) + '. ' if reasons else ''}A sex ratio can only give X depth "
                         "between 0.5 and 1× the autosomes, and only if depth behaves alike on both; here it is shaped "
                         "by something else, most likely reference divergence (reads from haplotypes divergent from "
                         "the reference fail to map, more on the autosomes than the X, which also widens the autosomal "
@@ -949,84 +1053,96 @@ def section_grid(P):
     runs = read_tsv(f"{P}.assess_runs.tsv")
     stats = read_tsv(f"{P}.assess_stats.tsv")
     deltas = read_tsv(f"{P}.assess_deltas.tsv")
-    if runs is None or "data_kept" not in runs:
+    targets = [t for t in TARGETS if runs is not None and f"data_kept_{t}" in runs]
+    if not targets:
         return ""
     assess = read_params(f"{P}.assess.params")
     tol = float(assess.get("TOLERANCE", "nan"))
     ref_run = assess.get("REFERENCE_RUN", "")
-    metric = str(runs["data_metric"].iloc[0])
+    judged = [c for c in assess.get("JUDGED_COVARIATES", "").split(",") if c]
+    cov_label = {"rho_rel_depth": "depth relative to the other pools", "rho_depth_imbalance": "depth imbalance",
+                 "rho_callable": "callable fraction", "rho_depth": "depth"}
     metric_label = {"pair_snps": "SNPs usable per pair of pools (mean over pairs)",
-                    "pool_snps": "SNPs usable per pool (mean over pools)", "snps": "SNPs"}.get(metric, metric)
-    rec_mask = runs["recommended"].astype(str) == "True"
-    ok_mask = runs["acceptable"].astype(str) == "True"
+                    "pool_snps": "SNPs usable per pool (mean over pools)", "snps": "SNPs"}
     role = runs["role"] if "role" in runs else pd.Series("candidate", index=runs.index)
-    colors = ["var(--s2)" if r else ("var(--s1)" if a else "var(--neutral)") for r, a in zip(rec_mask, ok_mask)]
     names = [r.replace("_", " ") + {"reference": " (reference)", "check": " (check)"}.get(ro, "")
              for r, ro in zip(runs["run"], role)]
-    base = float(runs.loc[runs["run"] == "recommended", "data_kept"].iloc[0]) \
-        if (runs["run"] == "recommended").any() else float(runs["data_kept"].max())
-    rel = lambda v: "" if v == base else f" ({100 * (v / base - 1):+.1f}%)"
-    left = hbars(names, runs["data_kept"].astype(float).tolist(), lambda v: compact(v) + rel(v),
-                 [f"{r.run}: {compact(r.data_kept)} ({metric}); {compact(r.callable_bp)} callable bp in any pool"
-                  for r in runs.itertuples()], "data kept per grid run", colors=colors, ml=190)
-    inc = runs["max_increase"].astype(float).fillna(0).clip(lower=0)
-    right = hbars(names, inc.tolist(), lambda v: f"+{v:.2f}" if v > 0 else "none",
-                  [f"{r.run}: largest increase {r.max_increase:+.3f} ({r.max_increase_on})" for r in runs.itertuples()],
-                  "largest artefact increase per grid run", colors=colors, ml=190,
-                  xmax=max(float(inc.max()), tol if np.isfinite(tol) else 0, 0.01) * 1.15,
-                  ref=(tol, f"accepted up to +{tol:.2f}") if np.isfinite(tol) else None)
-    legend = ('<div class="legend"><span><span class="dotkey" style="background:var(--s2)"></span>recommended</span>'
+    legend = ('<div class="legend"><span><span class="dotkey" style="background:var(--s2)"></span>chosen</span>'
               '<span><span class="dotkey" style="background:var(--s1)"></span>accepted (no statistic gets worse)</span>'
               '<span><span class="dotkey" style="background:var(--neutral)"></span>rejected, or a check</span></div>')
-    charts = (f'<div class="grid2"><div><h3>Data kept: {esc(metric_label)}</h3>{left}</div>'
-              f'<div><h3>Largest increase in any statistic\'s dependence on a technical covariate, '
-              f'against the reference run</h3>{right}</div></div>')
-    delta_html = ""
-    if deltas is not None:
-        dcols = [c for c in deltas.columns if ".rho_" in c]
-        dt = deltas[["run"] + dcols].copy()
-        dt.columns = ["run"] + [c.replace(".rho_", " vs ").replace("_", " ") for c in dcols]
-        vmax = max(float(np.nanmax(np.clip(dt.iloc[:, 1:].to_numpy(dtype=float), 0, None))), tol, 0.05)
-        delta_html = ("<h3>Change in each statistic's dependence on each covariate, against the reference</h3>"
-                      "<p>Median |ρ| of the run minus that of the reference run; positive (shaded) = more "
-                      f"dependence on a technical covariate. A run is accepted only if no cell exceeds +{tol:.2f}.</p>"
-                      + heat_table(dt, list(dt.columns[1:]), lambda v: f"{v:+.2f}", vmax=vmax,
-                                   scale=lambda v: max(v, 0.0), pick_row=lambda r: r["run"] in set(runs.loc[rec_mask, "run"])))
+    nice = lambda c: c.replace(".rho_", " vs ").replace("_", " ")
+    blocks = []
+    for t in targets:
+        rec_mask = runs[f"recommended_{t}"].astype(str) == "True"
+        ok_mask = runs[f"acceptable_{t}"].astype(str) == "True"
+        colors = ["var(--s2)" if r else ("var(--s1)" if a else "var(--neutral)") for r, a in zip(rec_mask, ok_mask)]
+        kept = runs[f"data_kept_{t}"].astype(float)
+        metric = str(runs[f"data_metric_{t}"].iloc[0])
+        base = float(kept[runs["run"] == ref_run].iloc[0]) if (runs["run"] == ref_run).any() else float(kept.max())
+        rel = lambda v: "" if v == base else f" ({100 * (v / base - 1):+.1f}%)"
+        left = hbars(names, kept.tolist(), lambda v: compact(v) + rel(v),
+                     [f"{r}: {compact(v)} ({metric})" for r, v in zip(runs["run"], kept)],
+                     f"{t} data kept per grid run", colors=colors, ml=190)
+        inc = runs[f"max_increase_{t}"].astype(float).fillna(0).clip(lower=0)
+        on = runs[f"max_increase_on_{t}"].fillna("").astype(str)
+        right = hbars(names, inc.tolist(), lambda v: f"+{v:.2f}" if v > 0 else "none",
+                      [f"{r}: largest increase {v:+.3f} ({o})" for r, v, o in zip(runs["run"], inc, on)],
+                      f"{t}: largest increase per grid run", colors=colors, ml=190,
+                      xmax=max(float(inc.max()), tol if np.isfinite(tol) else 0, 0.01) * 1.15,
+                      ref=(tol, f"accepted up to +{tol:.2f}") if np.isfinite(tol) else None)
+        rec = runs.loc[rec_mask, "run"]
+        rec = rec.iloc[0] if len(rec) else ref_run
+        delta_html = ""
+        if deltas is not None:
+            dcols = [c for c in deltas.columns if ".rho_" in c and c.split(".rho_")[0] in TARGET_TYPES[t]
+                     and (not judged or "rho_" + c.split(".rho_")[1] in judged)]
+            if dcols:
+                dt = deltas[["run"] + dcols].copy()
+                dt.columns = ["run"] + [nice(c) for c in dcols]
+                vmax = max(float(np.nanmax(np.clip(dt.iloc[:, 1:].to_numpy(dtype=float), 0, None))), tol, 0.05)
+                delta_html = ("<p>Change in each statistic's dependence on each judged covariate (median |ρ| of the "
+                              "run minus that of the reference); positive (shaded) = more dependence.</p>"
+                              + heat_table(dt, list(dt.columns[1:]), lambda v: f"{v:+.2f}", vmax=vmax,
+                                           scale=lambda v: max(v, 0.0), pick_row=lambda r, rec=rec: r["run"] == rec))
+        combo = f"combined_{t}"
+        combo_html = (f"<p>The <strong>{combo.replace('_', ' ')}</strong> run puts together the best accepted choice "
+                      f"of each setting for {t if t == 'diversity' else 'FST'}, and is judged by the same rule.</p>"
+                      if (runs["run"] == combo).any() else "")
+        blocks.append(f"<h3>{esc(TARGETS[t][0].upper() + TARGETS[t][1:])}: <strong>{esc(rec.replace('_', ' '))}</strong></h3>"
+                      f"<p>Data kept: {esc(metric_label.get(metric, metric).lower())}.</p>" + combo_html + legend
+                      + f'<div class="grid2"><div>{left}</div><div>{right}</div></div>' + delta_html)
+
     cov_cols = [c for c in runs.columns if ".rho_" in c]
     heat = runs[["run"] + cov_cols].copy()
-    heat.columns = ["run"] + [c.replace(".rho_", " vs ").replace("_", " ") for c in cov_cols]
-    tbl_cols = ["run", "role", "data_kept", "pair_snps", "pool_snps", "callable_bp", "snps", "windows_scored",
-                "max_increase", "max_increase_on", "acceptable", "recommended"]
+    heat.columns = ["run"] + [nice(c) for c in cov_cols]
     failed_html = ""
     failed_path = os.path.join(os.path.dirname(P), "grid", "failed_runs.tsv")
     if os.path.exists(failed_path) and os.path.getsize(failed_path):
         fr = pd.read_csv(failed_path, sep="\t", header=None, names=["run", "error"])
         failed_html = ('<p class="status">' + ICON_BAD + f"{len(fr)} grid run(s) failed and are left out of the "
                        "comparison</p>" + plain_table(fr))
-    combo_html = ""
-    if (runs["run"] == "combined").any():
-        combo_html = ("<p>The <strong>combined</strong> run puts together the best accepted choice of each setting, "
-                      "and is judged by the same rule as the others.</p>")
-    rec = runs.loc[rec_mask, "run"]
-    rec = rec.iloc[0] if len(rec) else None
+    tbl_cols = ["run", "role", "pair_snps", "pool_snps", "callable_bp", "snps", "windows_scored"] + [
+        f"{k}_{t}" for t in targets for k in ("max_increase", "max_increase_on", "acceptable", "recommended")]
     detail = ""
     if stats is not None:
         detail = ("<details><summary>Every statistic column (per pool / pair)</summary>"
                   + plain_table(stats) + "</details>")
+    judged_txt = ", ".join(cov_label.get(c, c) for c in judged) or "the technical covariates"
     return ("<section><h2>Filter grid</h2>"
-            "<p>The genome rerun with one setting changed at a time. For each run and each statistic (θπ, θW, FST), "
-            "the statistic is correlated across windows with read depth, depth imbalance between the two pools of a "
-            "pair, and the callable fraction of the window; none of these should matter. Each run is compared, "
-            f"statistic by statistic, with the reference run (<strong>{esc(ref_run.replace('_', ' '))}</strong>, the one "
-            "keeping least data): it is accepted only if no statistic's dependence on any covariate rises by more "
-            "than the tolerance, so an improvement in one statistic cannot buy a deterioration in another. Of the "
-            "accepted runs, the one keeping the most data is recommended. Data kept is counted the same way for "
-            f"every run: {esc(metric_label.lower())}.</p>"
-            + combo_html + failed_html + legend + charts + delta_html
-            + "<details><summary>Median |ρ| of each run</summary>"
+            "<p>The genome rerun with one setting changed at a time from the default settings. For each run and "
+            "each statistic (θπ, θW per pool; FST per pair), the statistic is correlated across windows with "
+            f"{esc(judged_txt)}; none of these should matter. Depth relative to the other pools is used rather "
+            "than depth itself: where every pool has low depth (often divergent haplotypes that map poorly, which "
+            "are also the most diverse regions) diversity drives depth, not the reverse, and judging on raw depth "
+            "would penalise keeping those regions. Each run is compared with the default settings "
+            f"(<strong>{esc(ref_run.replace('_', ' '))}</strong>), statistic by statistic: it is accepted if no "
+            "statistic's dependence on any covariate rises by more than the tolerance, and of the accepted runs the "
+            "one keeping the most data is chosen. Diversity and FST are separate grenedalf runs, so each gets its "
+            "own choice.</p>"
+            + failed_html + "".join(blocks)
+            + "<details><summary>Median |ρ| of each run, every covariate (absolute depth reported, not judged)</summary>"
             + heat_table(heat, list(heat.columns[1:]), lambda v: f"{v:.2f}",
-                         vmax=max(float(np.nanmax(heat.iloc[:, 1:].to_numpy(dtype=float))), 0.1),
-                         pick_row=lambda r: r["run"] == rec) + "</details>"
+                         vmax=max(float(np.nanmax(heat.iloc[:, 1:].to_numpy(dtype=float))), 0.1)) + "</details>"
             + f"<details><summary>Run table</summary>{plain_table(runs[[c for c in tbl_cols if c in runs]])}</details>"
             + detail + "</section>")
 

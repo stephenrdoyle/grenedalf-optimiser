@@ -33,16 +33,25 @@ done
 # grenedalf's mask rule: per-sample runs must not fail, and no grid run may fail
 [[ ! -s "$D/driver/grid/failed_runs.tsv" ]] || { echo "FAIL: grid runs failed: $(cat "$D/driver/grid/failed_runs.tsv")" >&2; exit 1; }
 grep -q "^per_sample_masks" "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: per_sample_masks run missing" >&2; exit 1; }
-# Per-statistic judging: the check run is never recommended; a combination run is built and judged
-awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} $1=="no_accessibility_mask" && $h["recommended"]=="True" {bad=1} END {exit bad}' \
-    "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: check run recommended" >&2; exit 1; }
-# (the stand-in keeps more SNPs with per-sample masks, fitted bounds and min count 2, as on real data)
-grep -q "^combined" "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: no combination run" >&2; exit 1; }
-awk -F'\t' '$1=="combined" && !($2==2 && $5=="per-sample" && $7=="fitted") {bad=1} END {exit bad}' "$D/driver/grid/runs.tsv" \
-    || { echo "FAIL: combination is not min count 2 + per-sample + fitted: $(grep ^combined "$D/driver/grid/runs.tsv")" >&2; exit 1; }
-grep -q "^combined" "$D/driver/grid/runs.tsv" || { echo "FAIL: combination run not recorded" >&2; exit 1; }
-grep -q "data_metric" "$D/driver/optimiser.assess_runs.tsv" && grep -q "pair_snps" "$D/driver/optimiser.assess_runs.tsv" \
-    || { echo "FAIL: data kept not per pair" >&2; exit 1; }
+# Per-statistic judging, separately for diversity and FST: the check run is never chosen;
+# a combination run is built and judged for each
+for t in diversity fst; do
+    awk -F'\t' -v t="$t" 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} $1=="no_accessibility_mask" && $h["recommended_" t]=="True" {bad=1} END {exit bad}' \
+        "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: check run chosen for $t" >&2; exit 1; }
+done
+grep -q "^smoothed_masks" "$D/driver/grid/runs.tsv" || { echo "FAIL: smoothed_masks run missing" >&2; exit 1; }
+grep -q "REFERENCE_RUN=default" "$D/driver/optimiser.assess.params" || { echo "FAIL: default run is not the reference" >&2; exit 1; }
+cut -f1 "$D/driver/grid/runs.tsv" > "$D/runs.txt"
+echo "grid runs: $(tr '\n' ' ' < "$D/runs.txt")"
+grep -q "^combined_" "$D/runs.txt" || { echo "FAIL: no combination run" >&2; exit 1; }
+for t in DIVERSITY FST; do
+    grep -q "^RECOMMENDED_RUN_$t=" "$D/driver/optimiser.assess.params" || { echo "FAIL: no $t choice" >&2; exit 1; }
+done
+grep -q "^DIVERSITY_MIN_COUNT=" "$D/driver/params.sh" && grep -q "^FST_MIN_COUNT=" "$D/driver/params.sh" \
+    || { echo "FAIL: params.sh without per-statistic settings" >&2; exit 1; }
+awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR==2 {exit !($h["data_metric_fst"]=="pair_snps" && $h["data_metric_diversity"]=="pool_snps")}' \
+    "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: data kept not per pair (fst) and per pool (diversity)" >&2; exit 1; }
+grep -q "by 5 Mb block\|by 1 Mb block" "$D/driver/optimiser_report.html" || { echo "FAIL: no masking-by-region table" >&2; exit 1; }
 # No Tajima's D anywhere in the grid
 ! grep -q "tajimas_d" "$D/driver/optimiser.assess_stats.tsv" || { echo "FAIL: Tajima's D assessed" >&2; exit 1; }
 
@@ -51,16 +60,21 @@ grep -q "data_metric" "$D/driver/optimiser.assess_runs.tsv" && grep -q "pair_snp
 n_reused=$(grep -c "reusing" "$D/rerun.log" || true)
 n_slow=$(grep -c -E "\] (mosdepth|profile|grenedalf|GenMap)" "$D/rerun.log" || true)
 [[ $n_reused -gt 0 && $n_reused -eq $n_slow ]] || { echo "FAIL: rerun recomputed slow steps ($n_reused reused of $n_slow)" >&2; exit 1; }
+# Results from before the default run was renamed ("recommended") are kept and reused
+mv "$D/driver/grid/default" "$D/driver/grid/recommended"
+sed -i.bak "s#/grid/default#/grid/recommended#g" "$D/driver/grid/recommended/.signature" && rm "$D/driver/grid/recommended/.signature.bak"
+"$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" grid > "$D/rerun_rename.log" 2>&1
+grep -q "grenedalf default: reusing" "$D/rerun_rename.log" || { echo "FAIL: renamed default run not reused" >&2; exit 1; }
 # A setting that changes the depth masks: grenedalf runs recompute, mosdepth and GenMap are reused
 echo "MAX_FOLD=2.5" >> "$D/config.sh"
 "$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" all > "$D/rerun2.log" 2>&1
-grep -q "grenedalf recommended: reusing" "$D/rerun2.log" && { echo "FAIL: changed mask not recomputed" >&2; exit 1; }
+grep -q "grenedalf default: reusing" "$D/rerun2.log" && { echo "FAIL: changed mask not recomputed" >&2; exit 1; }
 grep -q "mosdepth poolA_L3 MAPQ>=0: reusing" "$D/rerun2.log" || { echo "FAIL: mosdepth recomputed for a mask change" >&2; exit 1; }
 # Outputs from before the cache (no signatures): BAM-only steps adopted, the rest recomputed
 find "$D/driver" -name "*signature" -delete
 "$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" all > "$D/rerun3.log" 2>&1
 grep -q "mosdepth poolA_L3 MAPQ>=0: reusing" "$D/rerun3.log" || { echo "FAIL: pre-cache mosdepth bins not adopted" >&2; exit 1; }
 grep -q "profile poolA_L3: reusing" "$D/rerun3.log" || { echo "FAIL: pre-cache profile not adopted" >&2; exit 1; }
-grep -q "grenedalf recommended: reusing" "$D/rerun3.log" && { echo "FAIL: pre-cache grenedalf run adopted" >&2; exit 1; }
+grep -q "grenedalf default: reusing" "$D/rerun3.log" && { echo "FAIL: pre-cache grenedalf run adopted" >&2; exit 1; }
 
 echo "driver test passed ($D/driver)"

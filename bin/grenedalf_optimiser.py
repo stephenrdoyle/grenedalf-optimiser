@@ -596,6 +596,31 @@ def parse_bound(x):
     return np.inf if x in ("inf", "") else float(x)
 
 
+def smooth_mask(iv, lengths, width):
+    """Mask whole blocks of `width` bp in which most bases are masked, and nothing else.
+
+    Per-base depth wobbles across a bound by read sampling alone, so single bases near a
+    bound flip in and out of range, each pool at different bases; with a shared mask
+    almost every site near a bound is then lost in some pool. Judged on block means, a
+    site is dropped only when its region is out of range."""
+    out = []
+    for chrom, g in iv.groupby("chrom", sort=False):
+        L = int(lengths[chrom])
+        diff = np.zeros(L + 1, np.int8)   # intervals are merged: coverage is 0 or 1
+        np.add.at(diff, g["start"].clip(0, L).to_numpy(), 1)
+        np.add.at(diff, g["end"].clip(0, L).to_numpy(), -1)
+        cov = np.cumsum(diff[:L]) > 0
+        frac = np.add.reduceat(cov, np.arange(0, L, width)) / np.diff(np.append(np.arange(0, L, width), L))
+        keep = np.flatnonzero(frac > 0.5)
+        if len(keep):
+            starts = keep * width
+            ends = np.minimum(starts + width, L)
+            out.append(pd.DataFrame({"chrom": chrom, "start": starts, "end": ends}))
+    if not out:
+        return iv.iloc[0:0][["chrom", "start", "end"]]
+    return merge_intervals(pd.concat(out, ignore_index=True))
+
+
 def cmd_depthmask(args):
     thr = pd.read_csv(args.thresholds, sep="\t")
     classes = dict(pd.read_csv(args.chrom_class, sep="\t", dtype={"chrom": str}).itertuples(index=False))
@@ -631,6 +656,8 @@ def cmd_depthmask(args):
             log(f"warning: {name}: {int(straddle.sum())} quantize bins straddle a bound and are masked; "
                 "rerun the quantize step with the cut points from the thresholds step")
         out = merge_intervals(q.loc[~inside, ["chrom", "start", "end"]])
+        if args.smooth > 0:
+            out = smooth_mask(out, dict(zip(fai["chrom"], fai["length"])), args.smooth)
         per_pool[name] = out
         lost = bp_outside(out, base)
         row = {"pool": name}
@@ -644,7 +671,7 @@ def cmd_depthmask(args):
     lowers = [v for r in rows for k, v in r.items() if k.startswith("lower_")]
     uppers = [v for r in rows for k, v in r.items() if k.startswith("upper_")]
     params = {"MIN_FOLD": args.min_fold, "MAX_FOLD": args.max_fold, "MASK_MODE": args.mode,
-              "BOUND_METHOD": args.bound_method,
+              "BOUND_METHOD": args.bound_method, "SMOOTH": args.smooth,
               "MIN_DEPTH": min(lowers), "MAX_DEPTH": max(uppers)}
     if args.mode == "shared":
         total = merge_intervals(pd.concat([base] + list(per_pool.values()), ignore_index=True))
@@ -1102,44 +1129,66 @@ def cmd_commands(args):
     named_x = name_list(args.x_chroms)
     x_chroms = [c for c in fai["chrom"] if c in named_x and c not in mito]
     x_sep = cc.get("X_SEPARATE", "0") == "1" and x_chroms
-    base = merge_intervals(read_bed(args.total_mask))
     whole = lambda chroms: fai[fai["chrom"].isin(chroms)].assign(start=0).rename(columns={"length": "end"})[
         ["chrom", "start", "end"]]
+    # Diversity and FST may have been given different settings by the grid
+    settings = {stat: {"total": total, "samples": "" if samples == "-" else samples, "mc": mc,
+                       "min_depth": mind, "max_depth": maxd}
+                for stat, total, samples, mc, mind, maxd in args.settings}
+    one = len({tuple(v.values()) for v in settings.values()}) == 1
+    split_masks = {}
 
+    def class_mask(stat, label, drop):
+        """The stat's total mask plus whole contigs `drop`, written once per distinct mask."""
+        total = settings[stat]["total"]
+        key = (total, label)
+        if key not in split_masks:
+            tag = "" if len({v["total"] for v in settings.values()}) == 1 else f"{stat}."
+            path = f"{P}.{tag}mask_{label}.bed"
+            write_mask(pd.concat([merge_intervals(read_bed(total)), whole(drop)]), path, fai)
+            split_masks[key] = path
+        return split_masks[key]
+
+    # (key, description, {stat: (mask, sample masks, min depth, max depth)}, pool sizes)
     runs = []
     if x_sep:
         # Autosome run: X added to the mask. X run: everything but X added to the mask.
-        auto_mask = f"{P}.mask_autosomes.bed"
-        write_mask(pd.concat([base, whole(x_chroms)]), auto_mask, fai)
-        x_mask = f"{P}.mask_X.bed"
-        write_mask(pd.concat([base, whole([c for c in fai["chrom"] if c not in x_chroms])]), x_mask, fai)
-        runs.append(("autosomes", "autosomes (X masked; it gets its own pool sizes below)", auto_mask,
-                     args.pool_size_arg, args.min_depth, args.max_depth, args.sample_masks))
-        runs.append(("X", "X chromosome, with per-pool X pool sizes (fewer copies in pools with males)", x_mask,
-                     cc.get("X_POOL_SIZES", args.pool_size_arg), args.min_depth, args.max_depth, args.sample_masks))
+        not_x = [c for c in fai["chrom"] if c not in x_chroms]
+        runs.append(("autosomes", "autosomes (X masked; it gets its own pool sizes below)",
+                     {k: (class_mask(k, "autosomes", x_chroms), v["samples"], v["min_depth"], v["max_depth"])
+                      for k, v in settings.items()}, args.pool_size_arg))
+        runs.append(("X", "X chromosome, with per-pool X pool sizes (fewer copies in pools with males)",
+                     {k: (class_mask(k, "X", not_x), v["samples"], v["min_depth"], v["max_depth"])
+                      for k, v in settings.items()}, cc.get("X_POOL_SIZES", args.pool_size_arg)))
     else:
         runs.append(("nuclear", "autosomes" + (" and X (X depth matches the autosomes)" if x_chroms else ""),
-                     args.total_mask, args.pool_size_arg, args.min_depth, args.max_depth, args.sample_masks))
+                     {k: (v["total"], v["samples"], v["min_depth"], v["max_depth"]) for k, v in settings.items()},
+                     args.pool_size_arg))
     if mito and cc.get("MITO_SEPARATE", "0") == "1":
         m_mask = f"{P}.mask_mito.bed"
         write_mask(whole([c for c in fai["chrom"] if c not in mito]), m_mask, fai)
+        mm = (m_mask, cc.get("MITO_SAMPLE_MASKS", ""), cc.get("MITO_MIN_DEPTH"), cc.get("MITO_MAX_DEPTH"))
         runs.append(("mito", "mitochondrion: haploid, pool size = individuals, its own depth bounds "
-                     "(whole genome as one window)", m_mask, cc.get("MITO_POOL_SIZES", args.pool_size_arg),
-                     cc.get("MITO_MIN_DEPTH", args.min_depth), cc.get("MITO_MAX_DEPTH", args.max_depth),
-                     cc.get("MITO_SAMPLE_MASKS", "")))
+                     "(whole genome as one window)",
+                     {k: (mm[0], mm[1], mm[2] or v["min_depth"], mm[3] or v["max_depth"]) for k, v in settings.items()},
+                     cc.get("MITO_POOL_SIZES", args.pool_size_arg)))
 
     L = ["#!/usr/bin/env bash",
          f"# grenedalf commands recommended by grenedalf-optimiser ({pd.Timestamp.now():%Y-%m-%d}).",
          "# Settings chosen on technical criteria only; see optimiser_report.html for why.",
          "set -euo pipefail", "",
          f"OUTDIR={args.grenedalf_out}", f"THREADS={args.threads}", ""]
-    for key, desc, mask_bed, pools, mind, maxd, smasks in runs:
+    if not one:
+        L += ["# The grid chose different settings for diversity (theta, per pool) and FST (per pair):",
+              "# each command carries its own masks, minimum count and depth bounds.", ""]
+    for key, desc, per_stat, pools in runs:
         mito_run = key == "mito"
         L.append(f"# --- {desc}")
         # Tajima's D is not computed (grenedalf allows it only with a minimum count of exactly 2)
-        mc = str(args.min_count)
-        jobs = [("diversity", mc, "", ["--no-tajima-d"]), ("fst", mc, "", [f"--method {args.fst_method}"])]
-        for cmd, count, tag, extra in jobs:
+        jobs = [(cmd, extra) for cmd, extra in (("diversity", ["--no-tajima-d"]),
+                                                ("fst", [f"--method {args.fst_method}"])) if cmd in per_stat]
+        for cmd, extra in jobs:
+            mask_bed, smasks, mind, maxd = per_stat[cmd]
             c = [f"grenedalf {cmd}"]
             c += [f"--sam-path {b}" for b in args.bam]
             c += [f"--reference-genome-fai {args.fai}",
@@ -1147,7 +1196,7 @@ def cmd_commands(args):
                   f"--filter-mask-total-bed {mask_bed}"]
             if smasks:
                 c.append(f"--filter-mask-samples-bed-list {smasks}")
-            c += [f"--filter-sample-min-count {count}",
+            c += [f"--filter-sample-min-count {settings[cmd]['mc']}",
                   f"--filter-sample-min-read-depth {mind} --filter-sample-max-read-depth {maxd}"]
             if mito_run:
                 c.append("--window-type chromosomes")
@@ -1156,7 +1205,7 @@ def cmd_commands(args):
                          f"--window-interval-stride {args.stride}")
             c += ["--window-average-policy valid-loci", f"--pool-sizes {pools}"] + extra
             c += ["--separator-char tab --threads $THREADS",
-                  f"--out-dir $OUTDIR/{key} --file-prefix {key}_{tag}"]
+                  f"--out-dir $OUTDIR/{key} --file-prefix {key}_"]
             L.append(" \\\n    ".join(c))
             L.append("")
     if args.min_snps:
@@ -1368,6 +1417,15 @@ def spearman(a, b):
     return float(pd.Series(a[m]).rank().corr(pd.Series(b[m]).rank()))
 
 
+# Covariates a statistic should not depend on. rho_depth (mean depth of the pools) is
+# reported but not judged by default: where diversity lowers mapping in every pool, low
+# depth follows diversity rather than causing it.
+COVARIATES = ("rho_rel_depth", "rho_depth_imbalance", "rho_callable", "rho_depth")
+# target: (statistic types, data kept metric in order of preference)
+TARGETS = {"diversity": (("theta_pi", "theta_watterson"), ("pool_snps", "snps")),
+           "fst": (("fst",), ("pair_snps", "snps"))}
+
+
 def cmd_assess(args):
     depth = {}
     for name, path in args.depth or []:
@@ -1394,6 +1452,11 @@ def cmd_assess(args):
         # Statistics are only compared in windows with enough SNPs to be estimated precisely
         t = t[t["total.passed"] >= args.min_snps].reset_index(drop=True)
         wdepth = {p: window_depth(t, b, "norm") for p, b in depth.items()}
+        # Depth relative to all pools: depth shared by every pool (e.g. divergent haplotypes
+        # that map poorly everywhere, often also the most diverse regions) cancels out, so
+        # what is left is technical: one pool sampled more or less than the others here
+        with np.errstate(invalid="ignore", divide="ignore"):
+            all_mean = np.vstack(list(wdepth.values())).mean(axis=0) if wdepth else None
         stats = [c for c in t.columns if c.endswith(STAT_SUFFIXES)]
 
         for col in stats:
@@ -1406,8 +1469,9 @@ def cmd_assess(args):
             if all(p in wdepth for p in pools):
                 d = np.vstack([wdepth[p] for p in pools])
                 row["rho_depth"] = spearman(x, d.mean(axis=0))
-                if len(pools) == 2:
-                    with np.errstate(invalid="ignore", divide="ignore"):
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    row["rho_rel_depth"] = spearman(x, np.log2(d.mean(axis=0) / all_mean))
+                    if len(pools) == 2:
                         row["rho_depth_imbalance"] = spearman(x, np.abs(np.log2(d[0] / d[1])))
             stat_rows.append(row)
 
@@ -1430,66 +1494,79 @@ def cmd_assess(args):
                "pool_snps": round(pool_snps) if np.isfinite(pool_snps) else np.nan,
                "median_callable_frac": round(float(t["callable"].median()), 4) if len(t) else np.nan,
                "pair_callable_imbalance": round(imbalance, 4) if np.isfinite(imbalance) else np.nan}
-        # For each statistic type (theta_pi, theta_watterson, fst) and technical covariate:
-        # the median |rho| over pools or pairs
-        worst, worst_name = 0.0, ""
-        for cov in ("rho_depth", "rho_callable", "rho_depth_imbalance"):
+        # For each statistic type (theta_pi, theta_watterson, fst) and covariate: the median
+        # |rho| over pools or pairs
+        for cov in COVARIATES:
             if cov not in s:
                 continue
             for typ, g in s.groupby("type"):
                 v = g[cov].abs().dropna()
                 if len(v):
-                    v = float(v.median())
-                    row[f"{typ}.{cov}"] = round(v, 4)
-                    if v > worst:
-                        worst, worst_name = v, f"{typ} vs {cov[4:]}"
-        row["artefact"], row["worst"] = round(worst, 4), worst_name
+                    row[f"{typ}.{cov}"] = round(float(v.median()), 4)
         run_rows.append(row)
 
     runs_df = pd.DataFrame(run_rows)
     stats_df = pd.DataFrame(stat_rows)
-
-    # Data kept: what FST can use (per pair) when available, else per pool, else all SNPs
-    for metric in ("pair_snps", "pool_snps", "snps"):
-        if metric in runs_df and runs_df[metric].notna().all():
-            break
-    runs_df["data_metric"] = metric
-    runs_df["data_kept"] = runs_df[metric]
-
-    # Judged per statistic against a reference run (the one keeping least data, unless
-    # --strict): a run is accepted only if no statistic's dependence on any technical
-    # covariate rises by more than --tolerance. Some dependence is real (divergent
-    # haplotypes map less well), hence the comparison rather than an absolute threshold,
-    # and one statistic's improvement cannot buy another's deterioration.
     checks = set(args.check_run or [])
     candidates = runs_df[~runs_df["run"].isin(checks)]
-    strict = args.strict if args.strict else candidates.sort_values(["data_kept", "snps"], kind="stable")["run"].iloc[0]
-    ref = runs_df.set_index("run").loc[strict]
+    if args.reference and args.reference in set(candidates["run"]):
+        ref_run = args.reference
+    else:
+        ref_run = candidates["run"].iloc[0]
+        if args.reference:
+            log(f"reference run {args.reference} not found; using {ref_run}")
+    ref = runs_df.set_index("run").loc[ref_run]
+    judged = [c for c in args.covariates.split(",") if c]
     metric_cols = [c for c in runs_df.columns if ".rho_" in c]
     deltas = runs_df[["run"]].copy()
     for c in metric_cols:
         deltas[c] = (runs_df[c] - ref[c]).round(4)
-    d = deltas.set_index("run")[metric_cols]
-    runs_df["max_increase"] = d.max(axis=1, skipna=True).round(4).to_numpy()
-    on = d.idxmax(axis=1, skipna=True).fillna("").str.replace(".rho_", " vs ").to_numpy()
-    runs_df["max_increase_on"] = np.where(runs_df["max_increase"].fillna(0) > 0, on, "")
-    runs_df["acceptable"] = (runs_df["max_increase"].fillna(0) <= args.tolerance) & ~runs_df["run"].isin(checks)
-    runs_df["role"] = np.where(runs_df["run"].isin(checks), "check", np.where(runs_df["run"] == strict, "reference", "candidate"))
-    ok = runs_df[runs_df["acceptable"]]
-    key = list(zip(ok["data_kept"], ok["snps"]))
-    best = ok["run"].iloc[key.index(max(key))] if key else strict  # ties: first run listed
-    runs_df["recommended"] = runs_df["run"] == best
+    d_all = deltas.set_index("run")
+    runs_df["role"] = np.where(runs_df["run"].isin(checks), "check",
+                               np.where(runs_df["run"] == ref_run, "reference", "candidate"))
+
+    # Diversity (theta per pool) and FST (per pair) are separate grenedalf runs, so each gets
+    # its own settings: judged on its own statistics, with data kept counted the way that
+    # statistic uses it. A run is accepted for a target if none of the target's statistics
+    # depends on any judged covariate more than in the reference run (the default
+    # settings) by over --tolerance; of the accepted runs, the one keeping most data wins.
+    chosen = {}
+    for target, (types, metrics) in TARGETS.items():
+        cols = [c for c in metric_cols if c.split(".rho_")[0] in types and "rho_" + c.split(".rho_")[1] in judged]
+        if not cols:
+            continue
+        metric = next((m for m in metrics if m in runs_df and runs_df[m].notna().all()), "snps")
+        runs_df[f"data_metric_{target}"] = metric
+        runs_df[f"data_kept_{target}"] = runs_df[metric]
+        d = d_all[cols]
+        inc = d.max(axis=1, skipna=True).round(4).to_numpy()
+        on = d.idxmax(axis=1, skipna=True).fillna("").str.replace(".rho_", " vs ").to_numpy()
+        runs_df[f"max_increase_{target}"] = inc
+        runs_df[f"max_increase_on_{target}"] = np.where(np.nan_to_num(inc) > 0, on, "")
+        ok = (np.nan_to_num(inc) <= args.tolerance) & ~runs_df["run"].isin(checks)
+        runs_df[f"acceptable_{target}"] = ok
+        cand = runs_df[ok]
+        key = list(zip(cand[metric], cand["snps"]))
+        best = cand["run"].iloc[key.index(max(key))] if key else ref_run  # ties: first run listed
+        runs_df[f"recommended_{target}"] = runs_df["run"] == best
+        chosen[target] = best
 
     runs_df.to_csv(f"{args.out}.assess_runs.tsv", sep="\t", index=False)
     deltas.to_csv(f"{args.out}.assess_deltas.tsv", sep="\t", index=False)
     stats_df.round(4).to_csv(f"{args.out}.assess_stats.tsv", sep="\t", index=False)
-    show = ["run", "role", "data_kept", "callable_bp", "artefact", "max_increase", "max_increase_on", "acceptable",
-            "recommended"]
-    print(runs_df[show].to_string(index=False))
-    print(f"\ndata kept measured as {metric}; reference run: {strict}; tolerance {args.tolerance} on every statistic")
-    print(f"most permissive run that adds no technical artefact to any statistic: {best}")
+    for target in chosen:
+        show = ["run", "role", f"data_kept_{target}", f"max_increase_{target}", f"max_increase_on_{target}",
+                f"acceptable_{target}", f"recommended_{target}"]
+        print(f"\n{target}:")
+        print(runs_df[show].to_string(index=False))
+    print(f"\nreference run: {ref_run}; judged on {', '.join(judged)}; tolerance {args.tolerance}")
+    for target, best in chosen.items():
+        print(f"{target}: most data without any {target} statistic getting worse: {best}")
     with open(f"{args.out}.assess.params", "w") as fh:
-        fh.write(f"RECOMMENDED_RUN={best}\nTOLERANCE={args.tolerance}\nREFERENCE_RUN={strict}\n")
+        for target, best in chosen.items():
+            fh.write(f"RECOMMENDED_RUN_{target.upper()}={best}\n")
+        fh.write(f"RECOMMENDED_RUN={chosen.get('fst', ref_run)}\nTOLERANCE={args.tolerance}\n"
+                 f"REFERENCE_RUN={ref_run}\nJUDGED_COVARIATES={','.join(judged)}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1498,18 +1575,26 @@ def cmd_assess(args):
 def cmd_combine(args):
     """The best accepted choice of each setting, together, as one more grid run.
 
-    The grid changes one setting at a time from the baseline. For each setting (minimum
-    count, lower depth bound, upper depth bound, bound method, mask mode) take the accepted
-    run of that kind that keeps the most data, if it keeps more than the baseline, and
-    combine them. Prints the combined run's spec, or nothing if it equals an existing run."""
+    The grid changes one setting at a time from the default. For each setting (minimum
+    count, lower depth bound, upper depth bound, bound method, mask mode, smoothing) take
+    the run of that kind accepted for --target that keeps the most data, if it keeps more
+    than the default, and combine them. Prints the combined run's spec, or nothing if it
+    equals an existing run."""
+    t = args.target
     spec = pd.read_csv(args.runs, sep="\t", dtype=str)
+    if "smooth" not in spec:
+        spec["smooth"] = "0"
     res = pd.read_csv(args.assess, sep="\t")
+    if f"acceptable_{t}" not in res:
+        log(f"combination ({t}): no {t} statistics assessed")
+        return
+    res = res.rename(columns={f"acceptable_{t}": "acceptable", f"data_kept_{t}": "data_kept"})
     m = spec.merge(res[["run", "acceptable", "data_kept"]], on="run", how="left")
     base = m[m["setting"] == "baseline"].iloc[0]
     combo = base.copy()
     chosen = []
     for setting, fields in (("count", ["mc"]), ("lower", ["min_fold"]), ("upper", ["max_fold"]),
-                            ("method", ["method"]), ("mode", ["mode"])):
+                            ("method", ["method"]), ("mode", ["mode"]), ("smooth", ["smooth"])):
         c = m[(m["setting"] == setting) & (m["acceptable"].astype(str) == "True")
               & (m["data_kept"].astype(float) > float(base["data_kept"]))]
         if len(c):
@@ -1521,13 +1606,13 @@ def cmd_combine(args):
         combo["min_fold"], combo["max_fold"] = base["min_fold"], base["max_fold"]
         fold_runs = set(m.loc[m["setting"].isin(["lower", "upper"]), "run"])
         chosen = [c for c in chosen if c not in fold_runs]
-    fields = ["mc", "min_fold", "max_fold", "mode", "base", "method"]
+    fields = ["mc", "min_fold", "max_fold", "mode", "base", "method", "smooth"]
     same = (m[fields].astype(str) == combo[fields].astype(str)).all(axis=1)
     if len(chosen) < 2 or same.any():
-        log("combination: nothing new to combine" + (f" (best: {', '.join(chosen)})" if chosen else ""))
+        log(f"combination ({t}): nothing new to combine" + (f" (best: {', '.join(chosen)})" if chosen else ""))
         return
-    log(f"combination of {', '.join(chosen)}")
-    print("combined " + " ".join(str(combo[f]) for f in fields))
+    log(f"combination ({t}) of {', '.join(chosen)}")
+    print(f"combined_{t} " + " ".join(str(combo[f]) for f in fields))
 
 
 # ---------------------------------------------------------------------------
@@ -1603,6 +1688,9 @@ def main():
     p.add_argument("--mode", choices=["shared", "per-sample"], default="shared",
                    help="shared: one mask, every pool called at the same sites; "
                         "per-sample: one mask per pool (more sites, uneven missingness) [shared]")
+    p.add_argument("--smooth", type=int, default=0,
+                   help="judge depth on blocks of this many bp: a block is masked when most of it is out of "
+                        "range (0 = per base) [0]")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_depthmask)
 
@@ -1666,12 +1754,10 @@ def main():
     p.add_argument("--fai", required=True)
     p.add_argument("--bam", nargs="+", required=True)
     p.add_argument("--x-chroms", default="", help="sex chromosome contigs, comma separated")
-    p.add_argument("--total-mask", required=True)
-    p.add_argument("--sample-masks", default="")
+    p.add_argument("--settings", nargs=6, action="append", required=True,
+                   metavar=("STAT", "TOTAL_MASK", "SAMPLE_MASKS", "MIN_COUNT", "MIN_DEPTH", "MAX_DEPTH"),
+                   help="settings for diversity and/or fst (SAMPLE_MASKS - for none); repeat per statistic")
     p.add_argument("--pool-size-arg", required=True, help="value for grenedalf --pool-sizes (number or file)")
-    p.add_argument("--min-count", required=True)
-    p.add_argument("--min-depth", required=True)
-    p.add_argument("--max-depth", required=True)
     p.add_argument("--window", required=True)
     p.add_argument("--stride", required=True)
     p.add_argument("--min-snps", default="")
@@ -1685,6 +1771,7 @@ def main():
     p = sub.add_parser("combine", help="combine the best accepted grid settings into one run")
     p.add_argument("--runs", required=True, help="grid/runs.tsv: run, setting and its values")
     p.add_argument("--assess", required=True, help="<out>.assess_runs.tsv")
+    p.add_argument("--target", choices=list(TARGETS), required=True, help="statistics the combination is for")
     p.set_defaults(func=cmd_combine)
 
     p = sub.add_parser("ld", help="linkage scale from the decay of between-pool frequency correlation",
@@ -1711,10 +1798,14 @@ def main():
     p.add_argument("--depth", nargs=2, action="append", metavar=("POOL", "MQX_BINS"),
                    help="mosdepth bins at the MAPQ cut-off, named as the grenedalf samples")
     p.add_argument("--min-snps", type=int, default=50, help="windows with fewer SNPs are not scored [50]")
-    p.add_argument("--strict", help="reference run (default: the run keeping the least data)")
+    p.add_argument("--reference", "--strict", dest="reference",
+                   help="reference run, normally the default settings (default: the first run)")
+    p.add_argument("--covariates", default="rho_rel_depth,rho_depth_imbalance,rho_callable",
+                   help="covariates judged, comma separated, from " + ", ".join(COVARIATES)
+                   + " [rho_rel_depth,rho_depth_imbalance,rho_callable]")
     p.add_argument("--check-run", action="append", help="run evaluated but never recommended (e.g. no mask)")
     p.add_argument("--tolerance", type=float, default=0.05,
-                   help="largest increase, on any statistic and covariate, over the reference run [0.05]")
+                   help="largest increase, on any statistic and judged covariate, over the reference run [0.05]")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_assess)
 

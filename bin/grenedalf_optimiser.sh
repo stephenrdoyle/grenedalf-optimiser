@@ -70,6 +70,7 @@ MAX_FOLD=2.0
 ABS_MIN_DEPTH=10
 GRID_MIN_FOLDS=0.33,0.67
 GRID_MAX_FOLDS=1.5,3.0
+GRID_SMOOTH=100       # depth judged on blocks of this many bp in the smoothed_masks grid run
 TARGET_SNPS=50
 LD_REGION=            # chromosomes for the linkage scale (space separated); default: all analysed
 LD_MAX_DIST=100000
@@ -466,12 +467,13 @@ step_quantize() {
     done
 }
 
-# depthmask PREFIX MIN_FOLD MAX_FOLD MODE BASE_MASK [BOUND_METHOD]
+# depthmask PREFIX MIN_FOLD MAX_FOLD MODE BASE_MASK [BOUND_METHOD] [SMOOTH]
 depthmask() {
     local a=()
     for n in "${NAMES[@]}"; do a+=(--quantized "$n" "$OUT/quantize/$n.quantized.bed.gz"); done
     "${OPTIMISER[@]}" depthmask "${a[@]}" --thresholds "$P.depth_thresholds.tsv" --chrom-class "$P.chrom_class.tsv" \
-        --fai "$FAI" --base-mask "$5" --min-fold "$2" --max-fold "$3" --mode "$4" --bound-method "${6:-fold}" --out "$1"
+        --fai "$FAI" --base-mask "$5" --min-fold "$2" --max-fold "$3" --mode "$4" --bound-method "${6:-fold}" \
+        --smooth "${7:-0}" --out "$1"
 }
 
 step_depthmask() {
@@ -510,11 +512,11 @@ step_pilot() {
 
 # grid_run SPEC: one grid run (depth masks + grenedalf). A failure is recorded, not fatal.
 grid_run() {
-    local r rmc rmin rmax rmode rbase rmethod rsetting g="$OUT/grid"
-    read -r r rmc rmin rmax rmode rbase rmethod rsetting <<<"$1"
+    local r rmc rmin rmax rmode rbase rmethod rsmooth rsetting g="$OUT/grid"
+    read -r r rmc rmin rmax rmode rbase rmethod rsmooth rsetting <<<"$1"
     log "grid run $r"
     mkdir -p "$g/$r"
-    depthmask "$g/$r/mask" "$rmin" "$rmax" "$rmode" "$rbase" "$rmethod" > "$g/$r/depthmask.txt"
+    depthmask "$g/$r/mask" "$rmin" "$rmax" "$rmode" "$rbase" "$rmethod" "$rsmooth" > "$g/$r/depthmask.txt"
     # shellcheck source=/dev/null
     if ! ( source "$g/$r/mask.depthmask.params"
            run_grenedalf "$g/$r" "$TOTAL_MASK_BED" "$SAMPLE_MASK_LIST" "$rmc" "$MIN_DEPTH" "$MAX_DEPTH" \
@@ -525,8 +527,8 @@ grid_run() {
         printf '%s\t%s\n' "$r" "${why:-see $g/$r/*.log}" >> "$g/failed_runs.tsv"
         return 0
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$r" "$rmc" "$rmin" "$rmax" "$rmode" "$rbase" "$rmethod" "$rsetting" \
-        >> "$g/runs.tsv"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$r" "$rmc" "$rmin" "$rmax" "$rmode" "$rbase" "$rmethod" \
+        "$rsmooth" "$rsetting" >> "$g/runs.tsv"
 }
 
 grid_assess() {
@@ -537,62 +539,96 @@ grid_assess() {
     done < "$g/runs.tsv"
     [[ ${#a[@]} -gt 0 ]] || { echo "every grid run failed: see $g/failed_runs.tsv" >&2; exit 1; }
     for n in "${NAMES[@]}"; do a+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz"); done
-    "${OPTIMISER[@]}" assess "${a[@]}" --check-run no_accessibility_mask --min-snps "$MIN_SNPS" \
-        --tolerance "$TOLERANCE" --out "$P"
+    "${OPTIMISER[@]}" assess "${a[@]}" --reference default --check-run no_accessibility_mask \
+        --min-snps "$MIN_SNPS" --tolerance "$TOLERANCE" --out "$P"
 }
 
 step_grid() {
     check_grenedalf
     load_params
-    local g="$OUT/grid" runs=() mc=$MIN_COUNT spec
+    local g="$OUT/grid" runs=() mc=$MIN_COUNT spec m=$MASK_BED
     # Gaps and excluded chromosomes only: shows what the accessibility mask is doing
     awk '$4 ~ /excluded|gap/' "$P.mask_reasons.bed" | cut -f1-3 > "$g/minimal_mask.bed"
+    # The default run was called "recommended" before; keep its results under the new name
+    if [[ -d "$g/recommended" && ! -e "$g/default" ]]; then
+        mv "$g/recommended" "$g/default"
+        if [[ -f "$g/default/.signature" ]]; then
+            sed "s#$g/recommended#$g/default#g" "$g/default/.signature" > "$g/default/.signature.tmp"
+            mv "$g/default/.signature.tmp" "$g/default/.signature"
+        fi
+    fi
 
-    # One setting changed at a time from the baseline.
-    # Each run: name, min count, lower fold, upper fold, mask mode, accessibility mask, bound method, setting
-    runs+=("recommended $mc $MIN_FOLD $MAX_FOLD shared $MASK_BED fold baseline")
-    if [[ $mc -gt 1 ]]; then runs+=("min_count_$((mc - 1)) $((mc - 1)) $MIN_FOLD $MAX_FOLD shared $MASK_BED fold count"); fi
-    runs+=("min_count_$((mc + 1)) $((mc + 1)) $MIN_FOLD $MAX_FOLD shared $MASK_BED fold count")
-    for f in ${GRID_MIN_FOLDS//,/ }; do runs+=("min_fold_$f $mc $f $MAX_FOLD shared $MASK_BED fold lower"); done
-    for f in ${GRID_MAX_FOLDS//,/ }; do runs+=("max_fold_$f $mc $MIN_FOLD $f shared $MASK_BED fold upper"); done
+    # One setting changed at a time from the default settings.
+    # Each run: name, min count, lower fold, upper fold, mask mode, accessibility mask, bound method,
+    # smoothing (bp, 0 = per base), setting
+    runs+=("default $mc $MIN_FOLD $MAX_FOLD shared $m fold 0 baseline")
+    if [[ $mc -gt 1 ]]; then runs+=("min_count_$((mc - 1)) $((mc - 1)) $MIN_FOLD $MAX_FOLD shared $m fold 0 count"); fi
+    runs+=("min_count_$((mc + 1)) $((mc + 1)) $MIN_FOLD $MAX_FOLD shared $m fold 0 count")
+    for f in ${GRID_MIN_FOLDS//,/ }; do runs+=("min_fold_$f $mc $f $MAX_FOLD shared $m fold 0 lower"); done
+    for f in ${GRID_MAX_FOLDS//,/ }; do runs+=("max_fold_$f $mc $MIN_FOLD $f shared $m fold 0 upper"); done
     # bounds from each pool's fitted coverage distribution instead of fixed folds
-    runs+=("fitted_bounds $mc $MIN_FOLD $MAX_FOLD shared $MASK_BED fitted method")
-    runs+=("per_sample_masks $mc $MIN_FOLD $MAX_FOLD per-sample $MASK_BED fold mode")
-    runs+=("fitted_bounds_per_sample $mc $MIN_FOLD $MAX_FOLD per-sample $MASK_BED fitted method+mode")
+    runs+=("fitted_bounds $mc $MIN_FOLD $MAX_FOLD shared $m fitted 0 method")
+    runs+=("per_sample_masks $mc $MIN_FOLD $MAX_FOLD per-sample $m fold 0 mode")
+    runs+=("fitted_bounds_per_sample $mc $MIN_FOLD $MAX_FOLD per-sample $m fitted 0 method+mode")
+    # depth judged on blocks, so single bases near a bound do not drop sites
+    if [[ ${GRID_SMOOTH:-0} -gt 0 ]]; then
+        runs+=("smoothed_masks $mc $MIN_FOLD $MAX_FOLD shared $m fold $GRID_SMOOTH smooth")
+    fi
     # a check, never recommended: what the accessibility mask does
-    runs+=("no_accessibility_mask $mc $MIN_FOLD $MAX_FOLD shared $g/minimal_mask.bed fold check")
+    runs+=("no_accessibility_mask $mc $MIN_FOLD $MAX_FOLD shared $g/minimal_mask.bed fold 0 check")
 
     rm -f "$g/failed_runs.tsv"
-    printf 'run\tmc\tmin_fold\tmax_fold\tmode\tbase\tmethod\tsetting\n' > "$g/runs.tsv"
+    printf 'run\tmc\tmin_fold\tmax_fold\tmode\tbase\tmethod\tsmooth\tsetting\n' > "$g/runs.tsv"
     for spec in "${runs[@]}"; do grid_run "$spec"; done
     grid_assess
 
-    # The best accepted choice of each setting together, judged by the same rules
-    local combo
-    combo=$("${OPTIMISER[@]}" combine --runs "$g/runs.tsv" --assess "$P.assess_runs.tsv")
-    if [[ -n "$combo" ]]; then
-        grid_run "$combo combination"
-        grid_assess
-    fi
+    # For diversity and for FST: the best accepted choice of each setting together, judged by
+    # the same rules. The FST one is skipped if it is the same run as the diversity one.
+    local combo target added=0
+    for target in diversity fst; do
+        combo=$("${OPTIMISER[@]}" combine --runs "$g/runs.tsv" --assess "$P.assess_runs.tsv" --target "$target")
+        if [[ -n "$combo" ]]; then
+            grid_run "$combo combination"
+            added=1
+        fi
+    done
+    if [[ $added == 1 ]]; then grid_assess; fi
+}
+
+# run_settings RUN: the grid run's total mask, sample masks (- for none), min count, min and max depth
+run_settings() {
+    local mc
+    mc=$(awk -F'\t' -v r="$1" '$1 == r {print $2}' "$OUT/grid/runs.tsv" 2> /dev/null)
+    # shellcheck source=/dev/null
+    ( source "$OUT/grid/$1/mask.depthmask.params"
+      echo "$TOTAL_MASK_BED ${SAMPLE_MASK_LIST:--} ${mc:-$MIN_COUNT} $MIN_DEPTH $MAX_DEPTH" )
 }
 
 step_params() {
     load_params
-    local r=${RECOMMENDED_RUN:-recommended}
-    # shellcheck source=/dev/null
-    source "$OUT/grid/$r/mask.depthmask.params"
-    # the chosen run's minimum count, from the grid's run table
-    local mc
-    mc=$(awk -F'\t' -v r="$r" '$1 == r {print $2}' "$OUT/grid/runs.tsv" 2> /dev/null)
-    mc=${mc:-$MIN_COUNT}
+    local fst_run=${RECOMMENDED_RUN_FST:-${RECOMMENDED_RUN:-default}}
+    local div_run=${RECOMMENDED_RUN_DIVERSITY:-$fst_run}
+    local dt ds dmc dmin dmax ft fs fmc fmin fmax
+    read -r dt ds dmc dmin dmax <<<"$(run_settings "$div_run")"
+    read -r ft fs fmc fmin fmax <<<"$(run_settings "$fst_run")"
+    [[ $ds == - ]] && ds=""
+    [[ $fs == - ]] && fs=""
     cat > "$OUT/params.sh" <<EOF
-# grenedalf settings chosen by grenedalf_optimiser ($(date '+%F')), run: $r
+# grenedalf settings chosen by grenedalf_optimiser ($(date '+%F'))
 # Technical criteria only; see $P.assess_runs.tsv and the other $P.* tables.
-TOTAL_MASK_BED=$TOTAL_MASK_BED
-SAMPLE_MASK_LIST=$SAMPLE_MASK_LIST
-MIN_COUNT=$mc
-MIN_DEPTH=$MIN_DEPTH
-MAX_DEPTH=$MAX_DEPTH
+# Diversity (theta per pool) and FST (per pair of pools) are judged separately and may differ.
+# diversity: grid run $div_run
+DIVERSITY_TOTAL_MASK_BED=$dt
+DIVERSITY_SAMPLE_MASK_LIST=$ds
+DIVERSITY_MIN_COUNT=$dmc
+DIVERSITY_MIN_DEPTH=$dmin
+DIVERSITY_MAX_DEPTH=$dmax
+# fst: grid run $fst_run
+FST_TOTAL_MASK_BED=$ft
+FST_SAMPLE_MASK_LIST=$fs
+FST_MIN_COUNT=$fmc
+FST_MIN_DEPTH=$fmin
+FST_MAX_DEPTH=$fmax
 POOL_SIZES=$POOL_SIZE_ARG
 X_SEPARATE=${X_SEPARATE:-0}
 X_POOL_SIZES=${X_POOL_SIZES:-}
@@ -603,19 +639,21 @@ WINDOW=$WINDOW
 STRIDE=$STRIDE
 MIN_SNPS=$MIN_SNPS
 # Ready-to-run commands, one run per chromosome class: $OUT/grenedalf_commands.sh
-# grenedalf ... --filter-mask-total-bed \$TOTAL_MASK_BED \\
-#     \${SAMPLE_MASK_LIST:+--filter-mask-samples-bed-list \$SAMPLE_MASK_LIST} \\
-#     --filter-sample-min-count \$MIN_COUNT \\
-#     --filter-sample-min-read-depth \$MIN_DEPTH --filter-sample-max-read-depth \$MAX_DEPTH \\
+# grenedalf diversity ... --filter-mask-total-bed \$DIVERSITY_TOTAL_MASK_BED \\
+#     \${DIVERSITY_SAMPLE_MASK_LIST:+--filter-mask-samples-bed-list \$DIVERSITY_SAMPLE_MASK_LIST} \\
+#     --filter-sample-min-count \$DIVERSITY_MIN_COUNT \\
+#     --filter-sample-min-read-depth \$DIVERSITY_MIN_DEPTH --filter-sample-max-read-depth \$DIVERSITY_MAX_DEPTH \\
 #     --sam-min-map-qual \$MAPQ --sam-min-base-qual \$BASEQ \\
 #     --window-interval-width \$WINDOW --window-interval-stride \$STRIDE --window-average-policy valid-loci
+# grenedalf fst: the same with the FST_* values.
 # Drop windows with fewer than \$MIN_SNPS passed SNPs (total.passed) before interpreting them.
 EOF
     log "wrote $OUT/params.sh"
     cat "$OUT/params.sh"
     "${OPTIMISER[@]}" commands --prefix "$P" --out-dir "$OUT" --fai "$FAI" --bam "${BAMS[@]}" --x-chroms "$SEX_CHROMS" \
-        --total-mask "$TOTAL_MASK_BED" --sample-masks "$SAMPLE_MASK_LIST" --pool-size-arg "$POOL_SIZE_ARG" \
-        --min-count "$mc" --min-depth "$MIN_DEPTH" --max-depth "$MAX_DEPTH" --window "$WINDOW" --stride "$STRIDE" \
+        --settings diversity "$dt" "${ds:--}" "$dmc" "$dmin" "$dmax" \
+        --settings fst "$ft" "${fs:--}" "$fmc" "$fmin" "$fmax" \
+        --pool-size-arg "$POOL_SIZE_ARG" --window "$WINDOW" --stride "$STRIDE" \
         --min-snps "$MIN_SNPS" --map-qual "$MAPQ" --base-qual "$BASEQ" --fst-method "$FST_METHOD" --threads "$THREADS"
 }
 

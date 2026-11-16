@@ -178,6 +178,7 @@ def grenedalf(d):
                         pi *= nd[p] ** 1.5
                     row[f"{p}.theta_pi"] = pi
                     row[f"{p}.theta_watterson"] = pi * 1.1
+                    row[f"{p}.passed"] = passed
                     row[f"{p}.tajimas_d"] = r.normal(0, 0.5)
                 for i, a in enumerate(pools):
                     for b in pools[i + 1:]:

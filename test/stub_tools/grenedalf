@@ -39,7 +39,7 @@ if [[ $cmd == diversity && $no_tajima == 0 && $mc != 2 ]]; then
     echo "--filter-sample-min-count: Tajima's D requires the minimum allele count to be exactly 2" >&2
     exit 1
 fi
-# Usable SNPs per pair scale with how much the masks leave (as in a real run), so runs that
+# Usable SNPs per pool or pair scale with how much the masks leave (as in a real run), so runs that
 # mask less keep more data; the statistics themselves are the simulated "clean" ones
 scale_pairs() {
     python3 - "$1" "$2" "$total" "$samples" "$mc" <<'PY'
@@ -51,14 +51,14 @@ if samples:
     beds = [l.split("\t")[1].strip() for l in open(samples) if l.strip()]
     masked += sum(bp(b) for b in beds) / max(len(beds), 1) / 3   # per-sample: a pair loses less
 t = pd.read_csv(src, sep="\t")
-for c in [c for c in t.columns if ":" in c and c.endswith(".passed")]:
+for c in [c for c in t.columns if c.endswith(".passed") and not c.startswith("total.")]:
     # a lower minimum count keeps more SNPs
     t[c] = (t[c] * 1e6 / (1e6 + masked) * (1 + 0.1 * (3 - int(mc or 3)))).round().astype(int)
 t.to_csv(dst, sep="\t", index=False)
 PY
 }
 case $cmd in
-    diversity) cp "$SIM_DIR/clean.diversity.csv" "$out/diversity.csv" ;;
+    diversity) scale_pairs "$SIM_DIR/clean.diversity.csv" "$out/diversity.csv" ;;
     fst) scale_pairs "$SIM_DIR/clean.fst.csv" "$out/fst.csv" ;;
     frequency) gzip -c "$SIM_DIR/frequency.csv" > "$out/frequency.csv.gz" ;;
 esac

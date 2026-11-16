@@ -12,11 +12,12 @@ settings only on:
 - **how much of the genome stays callable**: more data means more chance of discovery
 - **whether every pool is called at the same sites**: uneven missingness between pools
   looks like differentiation
-- **whether the statistics depend on technical covariates**: θπ, Watterson's θ and FST should not track read depth, depth imbalance between pools, or the callable
+- **whether the statistics depend on technical covariates**: θπ, Watterson's θ and FST should not
+  track a pool's depth relative to the other pools, depth imbalance between pools, or the callable
   fraction of a window. When they do, the filter is letting artefact through.
 
 Each filter is loosened as far as it can go without adding such a dependence, compared
-with the strictest setting tried.
+with the default settings, separately for diversity and for FST.
 
 ## What it does
 
@@ -29,8 +30,8 @@ with the strictest setting tried.
 | `variance` | – | **What kind of depth variation there is**: per-base spread against pure read-sampling noise, how much of the variance persists in 1 kb and 10 kb means (regional blocks vs scattered noise), and, for the sites a lower bound would cut, whether they lie in blocks and whether they are low in one pool only (population divergence, deletions) or in most pools (reference, technical). Also the 1 kb depth correlation between pools. |
 | `quantize`, `depthmask` | mosdepth | Applies the per-pool bounds as BED masks. grenedalf has only one global depth filter, so per-pool bounds have to go in as masks. `shared` mode (default) merges them, so every pool is called at exactly the same sites. `per-sample` keeps more sites at the cost of uneven missingness; the grid tests both. |
 | `pilot` | grenedalf | The whole genome with the recommended settings. **Linkage scale** (`ld`): how far apart two SNPs have to be before their allele frequencies vary independently across pools (an LD decay for pool-seq, no phasing needed). **Window width**: wide enough for `TARGET_SNPS` SNPs in 90% of windows, and no narrower than the linkage scale. Also checks that grenedalf applied the mask the right way round. |
-| `grid` | grenedalf | The whole genome rerun with one setting changed at a time: minimum count ±1, lower and upper depth folds, fitted bounds, per-sample masks (and both together), and, as a check, no accessibility mask. `assess` compares each run with the reference run (the one keeping least data), **statistic by statistic**: a run is accepted only if none of θπ, θW or FST depends more on depth, depth imbalance or callable fraction than in the reference, beyond a tolerance. Then `combine` builds one more run from the best accepted choice of each setting, judged by the same rule. The accepted run keeping the most data (SNPs usable per pair of pools, counted the same way for every run) is recommended. |
-| `params` | – | `OUT/params.sh`, and `OUT/grenedalf_commands.sh`: ready-to-run grenedalf commands with every chosen value filled in, one run per chromosome class (nuclear, or autosomes + X, plus mitochondrion). |
+| `grid` | grenedalf | The whole genome rerun with one setting changed at a time from the default: minimum count ±1, lower and upper depth folds, fitted bounds, per-sample masks (and both together), depth judged on 100 bp blocks (`smoothed_masks`), and, as a check, no accessibility mask. `assess` compares each run with the default run, **statistic by statistic**, separately for diversity (θπ, θW) and FST: a run is accepted only if none of the statistics depends more on relative depth, depth imbalance or callable fraction than in the default run, beyond a tolerance. Then `combine` builds one more run per statistic from the best accepted choices, judged by the same rule. For each, the accepted run keeping the most data is chosen. |
+| `params` | – | `OUT/params.sh`, and `OUT/grenedalf_commands.sh`: ready-to-run grenedalf commands with every chosen value filled in, the diversity and FST commands each with their own settings, one run per chromosome class (nuclear, or autosomes + X, plus mitochondrion). |
 | `report` | – | `OUT/optimiser_report.html`: every step's results on one page (see below). |
 
 ### The linkage scale
@@ -109,22 +110,35 @@ is about ten genome-wide grenedalf diversity + FST runs, so it is the slow step
 ### How the grid affects the recommendation
 
 The grid decides the **minimum count**, the **depth bounds** (lower and upper fold, or fitted
-to each pool's coverage) and the **mask mode** (shared or per sample). It is a controlled
-experiment: from a baseline, one setting changes at a time, and each run is scored on
+to each pool's coverage), the **mask mode** (shared or per sample) and whether depth is judged
+per base or on 100 bp blocks. It is a controlled experiment: from the default settings, one
+setting changes at a time, and each run is scored on
 
-- **data kept**: SNPs usable per pair of pools, the data FST works with, counted the same
-  way whatever the mask mode (grenedalf's own totals count a site if any pool can use it,
-  which would flatter per-sample masks);
-- **artefact**: for θπ, θW and FST separately, how strongly the statistic follows read depth,
-  depth imbalance between the pools of a pair, and the callable fraction of each window.
+- **data kept**: for diversity, SNPs usable per pool; for FST, SNPs usable per pair of pools.
+  Both are counted the same way whatever the mask mode (grenedalf's own totals count a site if
+  any pool can use it, which would flatter per-sample masks);
+- **artefact**: for each statistic, how strongly it follows a pool's depth relative to the other
+  pools, depth imbalance between the pools of a pair, and the callable fraction of each window.
   None of these should matter.
 
-The reference is the run keeping least data. A run is accepted only if **no statistic** gets
-more dependent on any covariate than in the reference, beyond the tolerance (0.05), so an
-improvement in θπ cannot hide a deterioration in FST. The best accepted choice of each setting
-is then combined into one more run and judged the same way. Of all accepted runs, the one
-keeping the most data is recommended, and `params.sh`, `grenedalf_commands.sh` and the report
-use it. `no_accessibility_mask` is a check, never recommended: it shows what the mask does.
+Relative depth is used, not depth itself. Where every pool has low depth, usually divergent
+haplotypes that map poorly, those regions are often also the most diverse: diversity causes the
+low depth, not the reverse, and judging on raw depth penalises keeping them. Depth relative to
+the other pools cancels what all pools share and keeps what is technical (one pool sampled more
+or less than the rest). Raw depth is still reported.
+
+The reference is the **default run**. A run is accepted only if **no statistic** gets more
+dependent on any covariate than in the default run, beyond the tolerance (0.05), so an
+improvement in θπ cannot hide a deterioration in FST. (An earlier version used the run keeping
+least data as the reference; that run is the most heavily filtered and so has the least
+dependence, which made every other run fail and recommended discarding a third of the data.)
+
+Diversity and FST are separate grenedalf commands, so each gets its own choice: per-pool masks
+can suit θ, which is computed within a pool, while FST, which compares two pools at the same
+sites, may need the shared mask. For each, the best accepted choice of each setting is combined
+into one more run (`combined_diversity`, `combined_fst`) and judged the same way, and the
+accepted run keeping the most data is chosen. `params.sh`, `grenedalf_commands.sh` and the report
+use the two choices. `no_accessibility_mask` is a check, never chosen: it shows what the mask does.
 
 The grid does **not** change the accessibility mask, the window width (from SNP
 density and the linkage scale), the X / mitochondrion decision, or the read filters
@@ -153,14 +167,14 @@ per-base arrays and the GenMap bedGraph.
 | `depthmask_summary.tsv` | Accessible bases lost to each pool's bounds, and to the shared mask |
 | `ld_decay.tsv`, `ld.params` | r² against distance; LD_D50, LD_D10 |
 | `windows.txt`, `window_widths.tsv` | SNP density, callable fraction, recommended width, mask check |
-| `assess_runs.tsv` | Per grid run: callable bp, SNPs, median \|ρ\| of each statistic with depth, depth imbalance and callable fraction, artefact score, recommendation |
+| `assess_runs.tsv` | Per grid run: callable bp, SNPs per pool and pair, median \|ρ\| of each statistic with relative depth, depth imbalance, callable fraction and depth, and for diversity and FST: data kept, largest increase over the default run, accepted, chosen |
 | `assess_stats.tsv` | The same per statistic column (each pool, each pair) |
-| `OUT/params.sh` | Settings and masks for the full grenedalf run |
+| `OUT/params.sh` | Settings and masks for the full grenedalf runs (`DIVERSITY_*`, `FST_*`) |
 | `OUT/optimiser_report.html` | The report |
 
 Downstream, drop windows with fewer than `MIN_SNPS` passed SNPs. Note that
 `grenedalf frequency` applies no sample filters, so a script reading the frequency
-table has to apply `TOTAL_MASK_BED`, `MIN_COUNT` and the depth bounds itself (the `ld`
+table has to apply `FST_TOTAL_MASK_BED`, `FST_MIN_COUNT` and the depth bounds itself (the `ld`
 step does this).
 
 ## Check before trusting the first run
@@ -191,7 +205,8 @@ These depend on grenedalf behaviour that could not be tested here (written again
 - mosdepth writes its depth distribution to two decimals. Medians are reliable, but the
   1% and 99% quantiles are coarse.
 - Some dependence of diversity on depth is real: divergent haplotypes map less well and
-  lose depth. The tool therefore compares runs with the strictest run, not with zero.
+  lose depth. The tool therefore judges depth relative to the other pools, and compares runs
+  with the default run rather than with zero.
 - The linkage scale assumes the pools differ in frequency at least somewhat. With
   near-identical pools there is no excess r² to measure, and the window width falls back
   to SNP density alone.
@@ -207,16 +222,18 @@ any browser. It follows the light/dark setting, with a toggle. Sections:
   single-pool depth anomalies that were left in; the summary states how much more the shared
   depth mask removes than any single pool
 - **Where the mask falls**: a karyoplot per chromosome (the ten longest analysed contigs),
-  one row per mask reason plus the final mask, then one row per pool for sites outside
-  that pool's depth bounds (long blocks in one pool: divergent haplotypes, deletions, copy-number changes)
+  one row per mask reason plus the final mask of the chosen diversity and FST runs, then one row
+  per pool for sites outside that pool's depth bounds (long blocks in one pool: divergent
+  haplotypes, deletions, copy-number changes); then the final mask by 5 Mb block, naming
+  blocks that lose far more than the rest of the genome
 - **Depth per pool**: each pool's depth curve with its kept range, and how much of the
   accessible genome each pool's bounds (and the shared mask) cost
 - **Minimum allele count**: expected error-only sites per Mb at each count
 - **Linkage scale**: r² against distance, with the baseline and decay distances
 - **Window size**: windows reaching the SNP target by width, the linkage scale, and
   the mask orientation check
-- **Filter grid**: data kept and artefact score for every run, and the median |ρ| of
-  each statistic with each technical covariate
+- **Filter grid**: for diversity and for FST, data kept and the largest increase in
+  dependence on a technical covariate for every run, and the change per statistic and covariate
 
 Hovering over any mark shows its values. Tables sit under each chart. An example built
 from the synthetic test data is in [`docs/example_report.html`](docs/example_report.html).

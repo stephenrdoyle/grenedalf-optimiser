@@ -35,6 +35,7 @@ MAX_FOLD=2.0
 ABS_MIN_DEPTH=10
 GRID_MIN_FOLDS=0.33,0.67
 GRID_MAX_FOLDS=1.5,3.0
+GRID_SMOOTH=100      # a grid run judging depth on 100 bp blocks instead of single bases (0 = skip)
 
 # Windows
 TARGET_SNPS=50       # SNPs per window for a precise window estimate
@@ -42,7 +43,7 @@ PILOT_WINDOW=5000
 LD_MAX_DIST=100000
 
 FST_METHOD=unbiased-nei
-TOLERANCE=0.05       # artefact increase over the strictest run still accepted
+TOLERANCE=0.05       # rise in a statistic's dependence on a technical covariate, over the default run, still accepted
 
 # Tools: the conda environment from environment.yml (bin/grenedalf_optimiser.sh CONFIG setup)
 # is activated by every step. CONDA_ENV=none uses whatever is on PATH, e.g. farm modules.
