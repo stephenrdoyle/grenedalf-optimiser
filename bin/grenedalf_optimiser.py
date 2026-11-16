@@ -6,7 +6,7 @@ the pool-seq BAMs, before any biological signal is looked at.
 Nothing here uses population labels, phenotypes, or the location of peaks. The
 settings are judged only on technical grounds: how much of the genome stays
 callable, whether every pool is callable at the same sites, and whether the
-statistics (theta pi, Watterson's theta, Tajima's D, FST) depend on read depth or on
+statistics (theta pi, Watterson's theta, FST) depend on read depth or on
 how much of a window could be called. A filter is loosened only as far as it can be
 without adding such a dependence, so as little data as possible is thrown away.
 
@@ -35,6 +35,7 @@ Subcommands (run in this order; grenedalf_optimiser.sh runs the external tools b
               interval)? If not, they get their own grenedalf runs and pool sizes.
   ld          linkage scale: how fast the correlation of allele frequencies across
               pools decays with distance between SNPs (an LD decay for pool-seq).
+  combine     the best accepted choice of each setting, together, as one more grid run.
   assess      compares grenedalf runs over a grid of settings on technical criteria
               only, and names the most permissive setting that adds no artefact.
   commands    grenedalf_commands.sh: ready-to-run commands with the chosen settings.
@@ -62,7 +63,8 @@ FLAGS = {
     "low_depth": 64,       # consensus depth well below the chromosome median
 }
 
-STAT_SUFFIXES = (".theta_pi", ".theta_watterson", ".tajimas_d", ".fst")
+# Tajima's D is not used: grenedalf computes it only with a minimum count of exactly 2
+STAT_SUFFIXES = (".theta_pi", ".theta_watterson", ".fst")
 
 
 # ---------------------------------------------------------------------------
@@ -909,7 +911,9 @@ def cmd_chromclass(args):
     X: in a pool with males (hemizygous), X depth is below autosome depth, and the X is
     sampled from fewer copies, so grenedalf needs a smaller X pool size: with a fraction m
     of males, X depth / autosome depth = 1 - m/2, and the X pool size is pool_size * (1 - m/2).
-    A 50:50 pool gives 0.75.
+    A 50:50 pool gives 0.75. The ratio is only used when X and autosome depth have similar
+    spread (robust CV within --max-spread-ratio): otherwise depth is not tracking copy number
+    alike on both, as when divergence from the reference widens the autosomal distribution.
 
     The ratio is taken between the peaks (kernel density mode) of the two depth distributions,
     over well-mapped bins only (most reads pass the MAPQ cut-off). Medians are pulled down
@@ -979,14 +983,25 @@ def cmd_chromclass(args):
         if x.size:
             ratio = density_mode(x) / mode_a
             lo, hi = block_bootstrap_ratio(x, a, args.bootstrap, args.block, rng, stat=density_mode)
-            plausible = (0.5 - args.min_difference) <= ratio <= (1 + args.min_difference)
+            # Depth only measures copy number if it behaves alike on X and autosomes: if one
+            # is much more spread out (e.g. reference divergence on the autosomes), the ratio
+            # of their peaks says nothing reliable about the sex ratio.
+            rcv = lambda v: (np.subtract(*np.percentile(v, [75, 25])) / 1.349) / np.median(v) if v.size else np.nan
+            cv_a, cv_x = float(rcv(a)), float(rcv(x))
+            spread = max(cv_a, cv_x) / min(cv_a, cv_x) if min(cv_a, cv_x) > 0 else np.inf
+            in_range = (0.5 - args.min_difference) <= ratio <= (1 + args.min_difference)
+            plausible = bool(in_range and spread <= args.max_spread_ratio)
             m_est = float(np.clip(2 * (1 - ratio), 0, 1))
             row = {"pool": name, "class": "X", "bins": x.size, "median_depth": round(float(np.median(x_all)), 2),
                    "mode_depth": round(density_mode(x), 2), "ratio_to_A": round(ratio, 4),
                    "ratio_median": round(float(np.median(x_all) / np.median(a_all)), 4),
                    "ci_low": round(float(lo), 4), "ci_high": round(float(hi), 4),
                    "differs": bool((hi < 1 or lo > 1) and abs(ratio - 1) > args.min_difference),
+                   "cv_A": round(cv_a, 3), "cv_X": round(cv_x, 3), "spread_ratio": round(spread, 2),
                    "plausible": plausible,
+                   "unreliable_because": "" if plausible else
+                   ("ratio outside 0.5-1" if not in_range else "") + (" and " if not in_range and spread > args.max_spread_ratio else "")
+                   + (f"X and autosome depth spread differ {spread:.1f}x" if spread > args.max_spread_ratio else ""),
                    "male_fraction_est": round(m_est, 3) if plausible else np.nan,
                    "male_fraction_ci": f"{np.clip(2 * (1 - hi), 0, 1):.2f}-{np.clip(2 * (1 - lo), 0, 1):.2f}"
                    if plausible else "NA"}
@@ -1067,8 +1082,8 @@ def cmd_chromclass(args):
     if mito_rows:
         print("\n" + pd.DataFrame(mito_rows).to_string(index=False))
     if len(x) and params["X_RATIO_UNRELIABLE"]:
-        print("\nWARNING: X / autosome depth is outside the range a sex ratio can give (0.5-1) in at least one "
-              "pool: depth does not reflect copy number here (e.g. reference divergence). The male fraction "
+        why = "; ".join(sorted(set(x.loc[~x["plausible"].astype(bool), "unreliable_because"])))
+        print(f"\nWARNING: X / autosome depth cannot be read as a sex ratio here ({why}). The male fraction "
               "comes from --male-fraction, or 0.5 is assumed; set it from the study design.", file=sys.stderr)
 
 
@@ -1121,16 +1136,10 @@ def cmd_commands(args):
     for key, desc, mask_bed, pools, mind, maxd, smasks in runs:
         mito_run = key == "mito"
         L.append(f"# --- {desc}")
-        # grenedalf computes Tajima's D only with a minimum count of exactly 2: with any other
-        # count, theta pi / Watterson run without it, and Tajima's D gets its own run at 2
+        # Tajima's D is not computed (grenedalf allows it only with a minimum count of exactly 2)
         mc = str(args.min_count)
-        jobs = [("diversity", mc, "", [] if mc == "2" else ["--no-tajima-d"])]
-        if mc != "2":
-            jobs.append(("diversity", "2", "tajimas_d_", ["--no-theta-pi", "--no-theta-watterson"]))
-        jobs.append(("fst", mc, "", [f"--method {args.fst_method}"]))
+        jobs = [("diversity", mc, "", ["--no-tajima-d"]), ("fst", mc, "", [f"--method {args.fst_method}"])]
         for cmd, count, tag, extra in jobs:
-            if tag:
-                L.append(f"# Tajima's D: grenedalf requires a minimum count of exactly 2 for it")
             c = [f"grenedalf {cmd}"]
             c += [f"--sam-path {b}" for b in args.bam]
             c += [f"--reference-genome-fai {args.fai}",
@@ -1368,10 +1377,11 @@ def cmd_assess(args):
 
     run_rows, stat_rows = [], []
     for run, *tables in args.run:
-        frames = [read_grenedalf(p) for p in tables if p != "-"]
+        frames = [read_grenedalf(p) for p in tables if p != "-" and os.path.exists(p)]
         t = frames[0]
         for f in frames[1:]:
-            stat_cols = [c for c in f.columns if c.endswith(STAT_SUFFIXES) or re.search(r":.+\.(passed|missing)$", c)]
+            stat_cols = [c for c in f.columns if (c.endswith(STAT_SUFFIXES) or re.search(r":.+\.(passed|missing)$", c))
+                         and c not in t]
             t = t.merge(f[["chrom", "start", "end"] + stat_cols], on=["chrom", "start", "end"], how="outer")
         # Windows overlap when stride < width; divide sums by width / stride to count each base once
         strides = t.groupby("chrom")["start"].apply(lambda x: np.diff(np.sort(x.to_numpy()))).explode()
@@ -1380,6 +1390,7 @@ def cmd_assess(args):
         windows_all = len(t)
         callable_bp = int(t["valid"].sum() / step)
         snps = int(t["total.passed"].sum() / step)
+        full = t
         # Statistics are only compared in windows with enough SNPs to be estimated precisely
         t = t[t["total.passed"] >= args.min_snps].reset_index(drop=True)
         wdepth = {p: window_depth(t, b, "norm") for p, b in depth.items()}
@@ -1401,18 +1412,26 @@ def cmd_assess(args):
             stat_rows.append(row)
 
         s = pd.DataFrame([r for r in stat_rows if r["run"] == run])
-        pair_passed = [c for c in t.columns if re.search(r":.+\.passed$", c)]
+        # Data kept, like for like across mask modes. grenedalf's total.* columns count a site
+        # if any pool can use it, which flatters per-pool masks; what FST can use is a pair's
+        # own sites (<a>:<b>.passed), and what theta can use is a pool's own (<pool>.passed).
+        pair_cols = [c for c in full.columns if re.search(r":.+\.passed$", c)]
+        pool_cols = [c for c in full.columns if re.search(r"^[^:]+\.passed$", c) and not c.startswith("total.")]
+        pair_snps = float(full[pair_cols].sum().mean() / step) if pair_cols else np.nan
+        pool_snps = float(full[pool_cols].sum().mean() / step) if pool_cols else np.nan
         imbalance = np.nan
-        if pair_passed:
-            pp = t[pair_passed].to_numpy(dtype=float)
+        if pair_cols:
+            pp = t[[c for c in pair_cols if c in t]].to_numpy(dtype=float)
             with np.errstate(invalid="ignore", divide="ignore"):
                 imbalance = float(np.nanmedian((pp.max(axis=1) - pp.min(axis=1)) / pp.mean(axis=1)))
-        # Artefact score: for each statistic type (theta_pi, fst, ...) and technical
-        # covariate, the median |rho| over pools or pairs; the score is the worst of these.
         row = {"run": run, "windows": windows_all, "windows_scored": len(t),
                "callable_bp": callable_bp, "snps": snps,
+               "pair_snps": round(pair_snps) if np.isfinite(pair_snps) else np.nan,
+               "pool_snps": round(pool_snps) if np.isfinite(pool_snps) else np.nan,
                "median_callable_frac": round(float(t["callable"].median()), 4) if len(t) else np.nan,
                "pair_callable_imbalance": round(imbalance, 4) if np.isfinite(imbalance) else np.nan}
+        # For each statistic type (theta_pi, theta_watterson, fst) and technical covariate:
+        # the median |rho| over pools or pairs
         worst, worst_name = 0.0, ""
         for cov in ("rho_depth", "rho_callable", "rho_depth_imbalance"):
             if cov not in s:
@@ -1420,39 +1439,95 @@ def cmd_assess(args):
             for typ, g in s.groupby("type"):
                 v = g[cov].abs().dropna()
                 if len(v):
-                    v = v.median()
-                    row[f"{typ}.{cov}"] = round(float(v), 4)
+                    v = float(v.median())
+                    row[f"{typ}.{cov}"] = round(v, 4)
                     if v > worst:
-                        worst, worst_name = float(v), f"{typ} vs {cov[4:]}"
-        row["artefact"], row["worst"] = worst, worst_name
+                        worst, worst_name = v, f"{typ} vs {cov[4:]}"
+        row["artefact"], row["worst"] = round(worst, 4), worst_name
         run_rows.append(row)
 
     runs_df = pd.DataFrame(run_rows)
     stats_df = pd.DataFrame(stat_rows)
 
-    # Some dependence on depth can be real (divergent haplotypes map less well), so each
-    # run is judged against the strictest run rather than against zero.
-    # "Permissive" = more callable bases, then more SNPs (min-count changes only the latter)
-    by_data = runs_df.sort_values(["callable_bp", "snps"], kind="stable")
-    strict = args.strict if args.strict else by_data["run"].iloc[0]
-    ref = float(runs_df.loc[runs_df["run"] == strict, "artefact"].iloc[0])
-    runs_df["artefact_vs_strict"] = (runs_df["artefact"] - ref).round(4)
-    runs_df["acceptable"] = runs_df["artefact_vs_strict"] <= args.tolerance
+    # Data kept: what FST can use (per pair) when available, else per pool, else all SNPs
+    for metric in ("pair_snps", "pool_snps", "snps"):
+        if metric in runs_df and runs_df[metric].notna().all():
+            break
+    runs_df["data_metric"] = metric
+    runs_df["data_kept"] = runs_df[metric]
+
+    # Judged per statistic against a reference run (the one keeping least data, unless
+    # --strict): a run is accepted only if no statistic's dependence on any technical
+    # covariate rises by more than --tolerance. Some dependence is real (divergent
+    # haplotypes map less well), hence the comparison rather than an absolute threshold,
+    # and one statistic's improvement cannot buy another's deterioration.
+    checks = set(args.check_run or [])
+    candidates = runs_df[~runs_df["run"].isin(checks)]
+    strict = args.strict if args.strict else candidates.sort_values(["data_kept", "snps"], kind="stable")["run"].iloc[0]
+    ref = runs_df.set_index("run").loc[strict]
+    metric_cols = [c for c in runs_df.columns if ".rho_" in c]
+    deltas = runs_df[["run"]].copy()
+    for c in metric_cols:
+        deltas[c] = (runs_df[c] - ref[c]).round(4)
+    d = deltas.set_index("run")[metric_cols]
+    runs_df["max_increase"] = d.max(axis=1, skipna=True).round(4).to_numpy()
+    on = d.idxmax(axis=1, skipna=True).fillna("").str.replace(".rho_", " vs ").to_numpy()
+    runs_df["max_increase_on"] = np.where(runs_df["max_increase"].fillna(0) > 0, on, "")
+    runs_df["acceptable"] = (runs_df["max_increase"].fillna(0) <= args.tolerance) & ~runs_df["run"].isin(checks)
+    runs_df["role"] = np.where(runs_df["run"].isin(checks), "check", np.where(runs_df["run"] == strict, "reference", "candidate"))
     ok = runs_df[runs_df["acceptable"]]
-    key = list(zip(ok["callable_bp"], ok["snps"]))
+    key = list(zip(ok["data_kept"], ok["snps"]))
     best = ok["run"].iloc[key.index(max(key))] if key else strict  # ties: first run listed
     runs_df["recommended"] = runs_df["run"] == best
-    for c in runs_df.columns:
-        if runs_df[c].dtype == float:
-            runs_df[c] = runs_df[c].round(4)
 
     runs_df.to_csv(f"{args.out}.assess_runs.tsv", sep="\t", index=False)
+    deltas.to_csv(f"{args.out}.assess_deltas.tsv", sep="\t", index=False)
     stats_df.round(4).to_csv(f"{args.out}.assess_stats.tsv", sep="\t", index=False)
-    print(runs_df.to_string(index=False))
-    print(f"\nreference (strictest) run: {strict}; tolerance {args.tolerance}")
-    print(f"most permissive run that adds no technical artefact: {best}")
+    show = ["run", "role", "data_kept", "callable_bp", "artefact", "max_increase", "max_increase_on", "acceptable",
+            "recommended"]
+    print(runs_df[show].to_string(index=False))
+    print(f"\ndata kept measured as {metric}; reference run: {strict}; tolerance {args.tolerance} on every statistic")
+    print(f"most permissive run that adds no technical artefact to any statistic: {best}")
     with open(f"{args.out}.assess.params", "w") as fh:
-        fh.write(f"RECOMMENDED_RUN={best}\nTOLERANCE={args.tolerance}\n")
+        fh.write(f"RECOMMENDED_RUN={best}\nTOLERANCE={args.tolerance}\nREFERENCE_RUN={strict}\n")
+
+
+# ---------------------------------------------------------------------------
+# combine
+
+def cmd_combine(args):
+    """The best accepted choice of each setting, together, as one more grid run.
+
+    The grid changes one setting at a time from the baseline. For each setting (minimum
+    count, lower depth bound, upper depth bound, bound method, mask mode) take the accepted
+    run of that kind that keeps the most data, if it keeps more than the baseline, and
+    combine them. Prints the combined run's spec, or nothing if it equals an existing run."""
+    spec = pd.read_csv(args.runs, sep="\t", dtype=str)
+    res = pd.read_csv(args.assess, sep="\t")
+    m = spec.merge(res[["run", "acceptable", "data_kept"]], on="run", how="left")
+    base = m[m["setting"] == "baseline"].iloc[0]
+    combo = base.copy()
+    chosen = []
+    for setting, fields in (("count", ["mc"]), ("lower", ["min_fold"]), ("upper", ["max_fold"]),
+                            ("method", ["method"]), ("mode", ["mode"])):
+        c = m[(m["setting"] == setting) & (m["acceptable"].astype(str) == "True")
+              & (m["data_kept"].astype(float) > float(base["data_kept"]))]
+        if len(c):
+            best = c.sort_values("data_kept").iloc[-1]
+            for f in fields:
+                combo[f] = best[f]
+            chosen.append(best["run"])
+    if combo["method"] == "fitted":   # fitted bounds replace the folds
+        combo["min_fold"], combo["max_fold"] = base["min_fold"], base["max_fold"]
+        fold_runs = set(m.loc[m["setting"].isin(["lower", "upper"]), "run"])
+        chosen = [c for c in chosen if c not in fold_runs]
+    fields = ["mc", "min_fold", "max_fold", "mode", "base", "method"]
+    same = (m[fields].astype(str) == combo[fields].astype(str)).all(axis=1)
+    if len(chosen) < 2 or same.any():
+        log("combination: nothing new to combine" + (f" (best: {', '.join(chosen)})" if chosen else ""))
+        return
+    log(f"combination of {', '.join(chosen)}")
+    print("combined " + " ".join(str(combo[f]) for f in fields))
 
 
 # ---------------------------------------------------------------------------
@@ -1574,6 +1649,8 @@ def main():
                    "(default: estimated from X depth)")
     p.add_argument("--min-difference", type=float, default=0.05,
                    help="smallest |ratio - 1| treated as a real difference [0.05]")
+    p.add_argument("--max-spread-ratio", type=float, default=1.5,
+                   help="X/autosome depth ratio not used when their depth spreads (robust CV) differ more [1.5]")
     p.add_argument("--min-fold", type=float, default=0.5)
     p.add_argument("--max-fold", type=float, default=2.0)
     p.add_argument("--abs-min-depth", type=int, default=10)
@@ -1605,6 +1682,11 @@ def main():
     p.add_argument("--grenedalf-out", default="grenedalf_out")
     p.set_defaults(func=cmd_commands)
 
+    p = sub.add_parser("combine", help="combine the best accepted grid settings into one run")
+    p.add_argument("--runs", required=True, help="grid/runs.tsv: run, setting and its values")
+    p.add_argument("--assess", required=True, help="<out>.assess_runs.tsv")
+    p.set_defaults(func=cmd_combine)
+
     p = sub.add_parser("ld", help="linkage scale from the decay of between-pool frequency correlation",
                        description=cmd_ld_doc, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--frequency", required=True, help="grenedalf frequency table (--write-sample-counts)")
@@ -1629,9 +1711,10 @@ def main():
     p.add_argument("--depth", nargs=2, action="append", metavar=("POOL", "MQX_BINS"),
                    help="mosdepth bins at the MAPQ cut-off, named as the grenedalf samples")
     p.add_argument("--min-snps", type=int, default=50, help="windows with fewer SNPs are not scored [50]")
-    p.add_argument("--strict", help="reference run (default: the run with the fewest callable bp)")
+    p.add_argument("--strict", help="reference run (default: the run keeping the least data)")
+    p.add_argument("--check-run", action="append", help="run evaluated but never recommended (e.g. no mask)")
     p.add_argument("--tolerance", type=float, default=0.05,
-                   help="artefact increase over the strict run still accepted [0.05]")
+                   help="largest increase, on any statistic and covariate, over the reference run [0.05]")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_assess)
 

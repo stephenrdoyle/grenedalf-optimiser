@@ -271,9 +271,8 @@ run_grenedalf() {
     if [[ -n "$sample_masks" ]]; then args+=(--filter-mask-samples-bed-list "$sample_masks"); fi
     for bam in "${BAMS[@]}"; do args+=(--sam-path "$bam"); done
     mkdir -p "$dir"
-    # grenedalf computes Tajima's D only with a minimum count of exactly 2
-    local tajima=()
-    [[ $mc != 2 ]] && tajima=(--no-tajima-d)
+    # Tajima's D is not used (grenedalf computes it only with a minimum count of exactly 2)
+    local tajima=(--no-tajima-d)
     local sm_sums="" f
     if [[ -n "$sample_masks" ]]; then
         while IFS=$'\t' read -r _ f; do sm_sums+=" $(file_sum "$f")"; done < "$sample_masks"
@@ -509,50 +508,72 @@ step_pilot() {
         --mask-bed "$TOTAL_MASK_BED" --ld "$P.ld.params" --out "$P"
 }
 
+# grid_run SPEC: one grid run (depth masks + grenedalf). A failure is recorded, not fatal.
+grid_run() {
+    local r rmc rmin rmax rmode rbase rmethod rsetting g="$OUT/grid"
+    read -r r rmc rmin rmax rmode rbase rmethod rsetting <<<"$1"
+    log "grid run $r"
+    mkdir -p "$g/$r"
+    depthmask "$g/$r/mask" "$rmin" "$rmax" "$rmode" "$rbase" "$rmethod" > "$g/$r/depthmask.txt"
+    # shellcheck source=/dev/null
+    if ! ( source "$g/$r/mask.depthmask.params"
+           run_grenedalf "$g/$r" "$TOTAL_MASK_BED" "$SAMPLE_MASK_LIST" "$rmc" "$MIN_DEPTH" "$MAX_DEPTH" \
+               "$WINDOW" "$STRIDE" ); then
+        local why
+        why=$(grep -h -m1 -i -E "error|what\(\)" "$g/$r"/*.log 2> /dev/null | head -1 | tr '\t' ' ')
+        log "grid run $r FAILED (left out): ${why:-see $g/$r/*.log}"
+        printf '%s\t%s\n' "$r" "${why:-see $g/$r/*.log}" >> "$g/failed_runs.tsv"
+        return 0
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$r" "$rmc" "$rmin" "$rmax" "$rmode" "$rbase" "$rmethod" "$rsetting" \
+        >> "$g/runs.tsv"
+}
+
+grid_assess() {
+    local g="$OUT/grid" a=() r
+    while IFS=$'\t' read -r r _; do
+        [[ $r == run ]] && continue
+        a+=(--run "$r" "$g/$r/diversity.csv" "$g/$r/fst.csv")
+    done < "$g/runs.tsv"
+    [[ ${#a[@]} -gt 0 ]] || { echo "every grid run failed: see $g/failed_runs.tsv" >&2; exit 1; }
+    for n in "${NAMES[@]}"; do a+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz"); done
+    "${OPTIMISER[@]}" assess "${a[@]}" --check-run no_accessibility_mask --min-snps "$MIN_SNPS" \
+        --tolerance "$TOLERANCE" --out "$P"
+}
+
 step_grid() {
     check_grenedalf
     load_params
-    local g="$OUT/grid" runs=() mc=$MIN_COUNT
+    local g="$OUT/grid" runs=() mc=$MIN_COUNT spec
     # Gaps and excluded chromosomes only: shows what the accessibility mask is doing
     awk '$4 ~ /excluded|gap/' "$P.mask_reasons.bed" | cut -f1-3 > "$g/minimal_mask.bed"
 
-    # One setting changed at a time from the recommended one
-    # Each run: name, min count, lower fold, upper fold, mask mode, accessibility mask, bound method
-    runs+=("recommended $mc $MIN_FOLD $MAX_FOLD shared $MASK_BED fold")
-    if [[ $mc -gt 1 ]]; then runs+=("min_count_$((mc - 1)) $((mc - 1)) $MIN_FOLD $MAX_FOLD shared $MASK_BED fold"); fi
-    runs+=("min_count_$((mc + 1)) $((mc + 1)) $MIN_FOLD $MAX_FOLD shared $MASK_BED fold")
-    for f in ${GRID_MIN_FOLDS//,/ }; do runs+=("min_fold_$f $mc $f $MAX_FOLD shared $MASK_BED fold"); done
-    for f in ${GRID_MAX_FOLDS//,/ }; do runs+=("max_fold_$f $mc $MIN_FOLD $f shared $MASK_BED fold"); done
+    # One setting changed at a time from the baseline.
+    # Each run: name, min count, lower fold, upper fold, mask mode, accessibility mask, bound method, setting
+    runs+=("recommended $mc $MIN_FOLD $MAX_FOLD shared $MASK_BED fold baseline")
+    if [[ $mc -gt 1 ]]; then runs+=("min_count_$((mc - 1)) $((mc - 1)) $MIN_FOLD $MAX_FOLD shared $MASK_BED fold count"); fi
+    runs+=("min_count_$((mc + 1)) $((mc + 1)) $MIN_FOLD $MAX_FOLD shared $MASK_BED fold count")
+    for f in ${GRID_MIN_FOLDS//,/ }; do runs+=("min_fold_$f $mc $f $MAX_FOLD shared $MASK_BED fold lower"); done
+    for f in ${GRID_MAX_FOLDS//,/ }; do runs+=("max_fold_$f $mc $MIN_FOLD $f shared $MASK_BED fold upper"); done
     # bounds from each pool's fitted coverage distribution instead of fixed folds
-    runs+=("fitted_bounds $mc $MIN_FOLD $MAX_FOLD shared $MASK_BED fitted")
-    runs+=("fitted_bounds_per_sample $mc $MIN_FOLD $MAX_FOLD per-sample $MASK_BED fitted")
-    runs+=("per_sample_masks $mc $MIN_FOLD $MAX_FOLD per-sample $MASK_BED fold")
-    runs+=("no_accessibility_mask $mc $MIN_FOLD $MAX_FOLD shared $g/minimal_mask.bed fold")
+    runs+=("fitted_bounds $mc $MIN_FOLD $MAX_FOLD shared $MASK_BED fitted method")
+    runs+=("per_sample_masks $mc $MIN_FOLD $MAX_FOLD per-sample $MASK_BED fold mode")
+    runs+=("fitted_bounds_per_sample $mc $MIN_FOLD $MAX_FOLD per-sample $MASK_BED fitted method+mode")
+    # a check, never recommended: what the accessibility mask does
+    runs+=("no_accessibility_mask $mc $MIN_FOLD $MAX_FOLD shared $g/minimal_mask.bed fold check")
 
-    local assess=() spec r rmc rmin rmax rmode rbase rmethod
     rm -f "$g/failed_runs.tsv"
-    for spec in "${runs[@]}"; do
-        read -r r rmc rmin rmax rmode rbase rmethod <<<"$spec"
-        log "grid run $r"
-        mkdir -p "$g/$r"
-        depthmask "$g/$r/mask" "$rmin" "$rmax" "$rmode" "$rbase" "$rmethod" > "$g/$r/depthmask.txt"
-        # shellcheck source=/dev/null
-        # One failed run does not stop the grid: it is recorded, left out of the assessment,
-        # and listed in the report
-        if ! ( source "$g/$r/mask.depthmask.params"
-               run_grenedalf "$g/$r" "$TOTAL_MASK_BED" "$SAMPLE_MASK_LIST" "$rmc" "$MIN_DEPTH" "$MAX_DEPTH" \
-                   "$WINDOW" "$STRIDE" ); then
-            local why
-            why=$(grep -h -m1 -i -E "error|what\(\)" "$g/$r"/*.log 2> /dev/null | head -1 | tr '\t' ' ')
-            log "grid run $r FAILED (left out): ${why:-see $g/$r/*.log}"
-            printf '%s\t%s\n' "$r" "${why:-see $g/$r/*.log}" >> "$g/failed_runs.tsv"
-            continue
-        fi
-        assess+=(--run "$r" "$g/$r/diversity.csv" "$g/$r/fst.csv")
-    done
-    [[ ${#assess[@]} -gt 0 ]] || { echo "every grid run failed: see $g/failed_runs.tsv" >&2; exit 1; }
-    for n in "${NAMES[@]}"; do assess+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz"); done
-    "${OPTIMISER[@]}" assess "${assess[@]}" --min-snps "$MIN_SNPS" --tolerance "$TOLERANCE" --out "$P"
+    printf 'run\tmc\tmin_fold\tmax_fold\tmode\tbase\tmethod\tsetting\n' > "$g/runs.tsv"
+    for spec in "${runs[@]}"; do grid_run "$spec"; done
+    grid_assess
+
+    # The best accepted choice of each setting together, judged by the same rules
+    local combo
+    combo=$("${OPTIMISER[@]}" combine --runs "$g/runs.tsv" --assess "$P.assess_runs.tsv")
+    if [[ -n "$combo" ]]; then
+        grid_run "$combo combination"
+        grid_assess
+    fi
 }
 
 step_params() {
@@ -560,8 +581,10 @@ step_params() {
     local r=${RECOMMENDED_RUN:-recommended}
     # shellcheck source=/dev/null
     source "$OUT/grid/$r/mask.depthmask.params"
-    local mc=$MIN_COUNT
-    [[ $r == min_count_* ]] && mc=${r#min_count_}
+    # the chosen run's minimum count, from the grid's run table
+    local mc
+    mc=$(awk -F'\t' -v r="$r" '$1 == r {print $2}' "$OUT/grid/runs.tsv" 2> /dev/null)
+    mc=${mc:-$MIN_COUNT}
     cat > "$OUT/params.sh" <<EOF
 # grenedalf settings chosen by grenedalf_optimiser ($(date '+%F')), run: $r
 # Technical criteria only; see $P.assess_runs.tsv and the other $P.* tables.

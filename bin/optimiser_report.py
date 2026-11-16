@@ -345,7 +345,7 @@ def section_summary(P, out_dir):
     if ld.get("LD_D10", "NA") != "NA":
         tiles.append(tile("Linkage scale", bp(ld['LD_D10']), f"90% decay; half at {bp(ld['LD_D50'])}"))
     if run:
-        tiles.append(tile("Grid choice", run.replace("_", " "), "most permissive without added artefact"))
+        tiles.append(tile("Grid choice", run.replace("_", " "), "most data without any statistic getting worse"))
     body = f'<div class="tiles">{"".join(tiles)}</div>'
 
     thr = read_tsv(f"{P}.depth_thresholds.tsv")
@@ -828,11 +828,14 @@ def section_chromclass(P):
         verdict = ""
         if unreliable:
             src = x["male_fraction_source"].iloc[0] if "male_fraction_source" in x else ""
+            reasons = "; ".join(sorted(set(x.loc[~plaus, "unreliable_because"].dropna().astype(str)))) \
+                if "unreliable_because" in x else ""
             verdict += ('<p class="status">' + ICON_BAD + "X depth does not reflect copy number in this data</p>"
-                        "<p>In at least one pool the X has more depth than the autosomes, which no sex ratio can "
-                        "explain: depth is shaped by something else, most likely reference divergence (reads from "
-                        "haplotypes divergent from the reference fail to map, more on the autosomes than the X). "
-                        "So no pool's estimate is used: the male fraction is "
+                        f"<p>{esc(reasons.capitalize()) + '. ' if reasons else ''}A sex ratio can only give X depth "
+                        "between 0.5 and 1× the autosomes, and only if depth behaves alike on both; here it is shaped "
+                        "by something else, most likely reference divergence (reads from haplotypes divergent from "
+                        "the reference fail to map, more on the autosomes than the X, which also widens the autosomal "
+                        "depth distribution). So no pool's estimate is used: the male fraction is "
                         + ("taken from <code>MALE_FRACTION</code>." if src == "known" else
                            "assumed to be 0.5. <strong>Set <code>MALE_FRACTION</code> from the study design.</strong>")
                         + "</p>")
@@ -840,11 +843,12 @@ def section_chromclass(P):
         verdict += (f'<p class="status">{ICON_INFO if sep else ICON_OK}'
                     + ("The X gets its own grenedalf run, with the X pool sizes below" if sep
                        else "The X can be analysed with the autosomes") + "</p>")
-        cols = [c for c in ["pool", "ratio_to_A", "ci_low", "ci_high", "ratio_median", "male_fraction_est",
+        cols = [c for c in ["pool", "ratio_to_A", "ci_low", "ci_high", "ratio_median", "cv_A", "cv_X", "male_fraction_est",
                             "male_fraction_known", "male_fraction_used", "male_fraction_source", "pool_size"] if c in x]
         tx = x[cols].copy()
         tx.columns = [{"ratio_to_A": "X / A depth (peaks)", "ci_low": "95% low", "ci_high": "95% high",
-                       "ratio_median": "X / A (medians)", "male_fraction_est": "male fraction (est.)",
+                       "ratio_median": "X / A (medians)", "cv_A": "spread (CV) A", "cv_X": "spread (CV) X",
+                       "male_fraction_est": "male fraction (est.)",
                        "male_fraction_known": "male fraction (known)", "male_fraction_used": "used",
                        "male_fraction_source": "from", "pool_size": "X pool size"}.get(c, c) for c in cols]
         if "matches_known" in x and x["male_fraction_known"].notna().any() and not unreliable \
@@ -944,58 +948,85 @@ def section_windows(P):
 def section_grid(P):
     runs = read_tsv(f"{P}.assess_runs.tsv")
     stats = read_tsv(f"{P}.assess_stats.tsv")
-    if runs is None:
+    deltas = read_tsv(f"{P}.assess_deltas.tsv")
+    if runs is None or "data_kept" not in runs:
         return ""
     assess = read_params(f"{P}.assess.params")
-    strict = float(runs["artefact"].iloc[0] - runs["artefact_vs_strict"].iloc[0])
     tol = float(assess.get("TOLERANCE", "nan"))
+    ref_run = assess.get("REFERENCE_RUN", "")
+    metric = str(runs["data_metric"].iloc[0])
+    metric_label = {"pair_snps": "SNPs usable per pair of pools (mean over pairs)",
+                    "pool_snps": "SNPs usable per pool (mean over pools)", "snps": "SNPs"}.get(metric, metric)
     rec_mask = runs["recommended"].astype(str) == "True"
     ok_mask = runs["acceptable"].astype(str) == "True"
+    role = runs["role"] if "role" in runs else pd.Series("candidate", index=runs.index)
     colors = ["var(--s2)" if r else ("var(--s1)" if a else "var(--neutral)") for r, a in zip(rec_mask, ok_mask)]
-    names = [r.replace("_", " ") for r in runs["run"]]
-    base_bp = float(runs.loc[rec_mask, "callable_bp"].iloc[0]) if rec_mask.any() else float(runs["callable_bp"].max())
-    rel = lambda v: "" if v == base_bp else f" ({100 * (v / base_bp - 1):+.1f}%)"
-    left = hbars(names, runs["callable_bp"].astype(float).tolist(), lambda v: compact(v) + rel(v),
-                 [f"{r.run}: {r.callable_bp:,} callable bp, {r.snps:,} SNPs" for r in runs.itertuples()],
-                 "callable bp per grid run", colors=colors, ml=150)
-    limit = strict + tol if np.isfinite(tol) else None
-    right = hbars(names, runs["artefact"].astype(float).tolist(), lambda v: f"{v:.2f}",
-                  [f"{r.run}: {r.artefact:.3f} ({r.worst}), {r.artefact_vs_strict:+.3f} vs strictest" for r in runs.itertuples()],
-                  "artefact score per grid run", colors=colors, ml=150,
-                  xmax=max(float(runs["artefact"].max()), (limit or 0)) * 1.1,
-                  ref=(limit, f"accepted up to {limit:.2f}") if limit is not None else None)
+    names = [r.replace("_", " ") + {"reference": " (reference)", "check": " (check)"}.get(ro, "")
+             for r, ro in zip(runs["run"], role)]
+    base = float(runs.loc[runs["run"] == "recommended", "data_kept"].iloc[0]) \
+        if (runs["run"] == "recommended").any() else float(runs["data_kept"].max())
+    rel = lambda v: "" if v == base else f" ({100 * (v / base - 1):+.1f}%)"
+    left = hbars(names, runs["data_kept"].astype(float).tolist(), lambda v: compact(v) + rel(v),
+                 [f"{r.run}: {compact(r.data_kept)} ({metric}); {compact(r.callable_bp)} callable bp in any pool"
+                  for r in runs.itertuples()], "data kept per grid run", colors=colors, ml=190)
+    inc = runs["max_increase"].astype(float).fillna(0).clip(lower=0)
+    right = hbars(names, inc.tolist(), lambda v: f"+{v:.2f}" if v > 0 else "none",
+                  [f"{r.run}: largest increase {r.max_increase:+.3f} ({r.max_increase_on})" for r in runs.itertuples()],
+                  "largest artefact increase per grid run", colors=colors, ml=190,
+                  xmax=max(float(inc.max()), tol if np.isfinite(tol) else 0, 0.01) * 1.15,
+                  ref=(tol, f"accepted up to +{tol:.2f}") if np.isfinite(tol) else None)
     legend = ('<div class="legend"><span><span class="dotkey" style="background:var(--s2)"></span>recommended</span>'
-              '<span><span class="dotkey" style="background:var(--s1)"></span>accepted (no added artefact)</span>'
-              '<span><span class="dotkey" style="background:var(--neutral)"></span>rejected</span></div>')
-    charts = (f'<div class="grid2"><div><h3>Data kept: callable bp on the pilot region</h3>{left}</div>'
-              f'<div><h3>Artefact score: worst median |ρ| with a technical covariate</h3>{right}</div></div>')
+              '<span><span class="dotkey" style="background:var(--s1)"></span>accepted (no statistic gets worse)</span>'
+              '<span><span class="dotkey" style="background:var(--neutral)"></span>rejected, or a check</span></div>')
+    charts = (f'<div class="grid2"><div><h3>Data kept: {esc(metric_label)}</h3>{left}</div>'
+              f'<div><h3>Largest increase in any statistic\'s dependence on a technical covariate, '
+              f'against the reference run</h3>{right}</div></div>')
+    delta_html = ""
+    if deltas is not None:
+        dcols = [c for c in deltas.columns if ".rho_" in c]
+        dt = deltas[["run"] + dcols].copy()
+        dt.columns = ["run"] + [c.replace(".rho_", " vs ").replace("_", " ") for c in dcols]
+        vmax = max(float(np.nanmax(np.clip(dt.iloc[:, 1:].to_numpy(dtype=float), 0, None))), tol, 0.05)
+        delta_html = ("<h3>Change in each statistic's dependence on each covariate, against the reference</h3>"
+                      "<p>Median |ρ| of the run minus that of the reference run; positive (shaded) = more "
+                      f"dependence on a technical covariate. A run is accepted only if no cell exceeds +{tol:.2f}.</p>"
+                      + heat_table(dt, list(dt.columns[1:]), lambda v: f"{v:+.2f}", vmax=vmax,
+                                   scale=lambda v: max(v, 0.0), pick_row=lambda r: r["run"] in set(runs.loc[rec_mask, "run"])))
     cov_cols = [c for c in runs.columns if ".rho_" in c]
     heat = runs[["run"] + cov_cols].copy()
     heat.columns = ["run"] + [c.replace(".rho_", " vs ").replace("_", " ") for c in cov_cols]
-    tbl_cols = ["run", "callable_bp", "snps", "windows_scored", "artefact", "worst", "artefact_vs_strict",
-                "acceptable", "recommended"]
+    tbl_cols = ["run", "role", "data_kept", "pair_snps", "pool_snps", "callable_bp", "snps", "windows_scored",
+                "max_increase", "max_increase_on", "acceptable", "recommended"]
     failed_html = ""
     failed_path = os.path.join(os.path.dirname(P), "grid", "failed_runs.tsv")
     if os.path.exists(failed_path) and os.path.getsize(failed_path):
         fr = pd.read_csv(failed_path, sep="\t", header=None, names=["run", "error"])
         failed_html = ('<p class="status">' + ICON_BAD + f"{len(fr)} grid run(s) failed and are left out of the "
                        "comparison</p>" + plain_table(fr))
-    rec = runs.loc[runs["recommended"].astype(str) == "True", "run"]
+    combo_html = ""
+    if (runs["run"] == "combined").any():
+        combo_html = ("<p>The <strong>combined</strong> run puts together the best accepted choice of each setting, "
+                      "and is judged by the same rule as the others.</p>")
+    rec = runs.loc[rec_mask, "run"]
     rec = rec.iloc[0] if len(rec) else None
     detail = ""
     if stats is not None:
         detail = ("<details><summary>Every statistic column (per pool / pair)</summary>"
                   + plain_table(stats) + "</details>")
     return ("<section><h2>Filter grid</h2>"
-            "<p>The pilot region rerun with one setting changed at a time. For each run, each statistic "
-            "(θπ, θW, Tajima's D, FST) is correlated across windows with read depth, depth imbalance between the "
-            "two pools of a pair, and the callable fraction of the window; none of these should matter. The artefact "
-            "score is the worst median |ρ|. Runs no worse than the strictest run (within the tolerance) are accepted, "
-            "and the one keeping the most data is recommended.</p>"
-            + failed_html + legend + charts
-            + "<h3>Median |ρ| with each technical covariate</h3>"
-            + heat_table(heat, list(heat.columns[1:]), lambda v: f"{v:.2f}", vmax=max(float(np.nanmax(heat.iloc[:, 1:].to_numpy(dtype=float))), 0.1),
-                         pick_row=lambda r: r["run"] == rec)
+            "<p>The genome rerun with one setting changed at a time. For each run and each statistic (θπ, θW, FST), "
+            "the statistic is correlated across windows with read depth, depth imbalance between the two pools of a "
+            "pair, and the callable fraction of the window; none of these should matter. Each run is compared, "
+            f"statistic by statistic, with the reference run (<strong>{esc(ref_run.replace('_', ' '))}</strong>, the one "
+            "keeping least data): it is accepted only if no statistic's dependence on any covariate rises by more "
+            "than the tolerance, so an improvement in one statistic cannot buy a deterioration in another. Of the "
+            "accepted runs, the one keeping the most data is recommended. Data kept is counted the same way for "
+            f"every run: {esc(metric_label.lower())}.</p>"
+            + combo_html + failed_html + legend + charts + delta_html
+            + "<details><summary>Median |ρ| of each run</summary>"
+            + heat_table(heat, list(heat.columns[1:]), lambda v: f"{v:.2f}",
+                         vmax=max(float(np.nanmax(heat.iloc[:, 1:].to_numpy(dtype=float))), 0.1),
+                         pick_row=lambda r: r["run"] == rec) + "</details>"
             + f"<details><summary>Run table</summary>{plain_table(runs[[c for c in tbl_cols if c in runs]])}</details>"
             + detail + "</section>")
 

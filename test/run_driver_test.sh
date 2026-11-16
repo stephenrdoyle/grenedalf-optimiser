@@ -33,6 +33,18 @@ done
 # grenedalf's mask rule: per-sample runs must not fail, and no grid run may fail
 [[ ! -s "$D/driver/grid/failed_runs.tsv" ]] || { echo "FAIL: grid runs failed: $(cat "$D/driver/grid/failed_runs.tsv")" >&2; exit 1; }
 grep -q "^per_sample_masks" "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: per_sample_masks run missing" >&2; exit 1; }
+# Per-statistic judging: the check run is never recommended; a combination run is built and judged
+awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} $1=="no_accessibility_mask" && $h["recommended"]=="True" {bad=1} END {exit bad}' \
+    "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: check run recommended" >&2; exit 1; }
+# (the stand-in keeps more SNPs with per-sample masks, fitted bounds and min count 2, as on real data)
+grep -q "^combined" "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: no combination run" >&2; exit 1; }
+awk -F'\t' '$1=="combined" && !($2==2 && $5=="per-sample" && $7=="fitted") {bad=1} END {exit bad}' "$D/driver/grid/runs.tsv" \
+    || { echo "FAIL: combination is not min count 2 + per-sample + fitted: $(grep ^combined "$D/driver/grid/runs.tsv")" >&2; exit 1; }
+grep -q "^combined" "$D/driver/grid/runs.tsv" || { echo "FAIL: combination run not recorded" >&2; exit 1; }
+grep -q "data_metric" "$D/driver/optimiser.assess_runs.tsv" && grep -q "pair_snps" "$D/driver/optimiser.assess_runs.tsv" \
+    || { echo "FAIL: data kept not per pair" >&2; exit 1; }
+# No Tajima's D anywhere in the grid
+! grep -q "tajimas_d" "$D/driver/optimiser.assess_stats.tsv" || { echo "FAIL: Tajima's D assessed" >&2; exit 1; }
 
 # Cache: a second run with nothing changed reuses every slow result
 "$HERE/../bin/grenedalf_optimiser.sh" "$D/config.sh" all > "$D/rerun.log" 2>&1

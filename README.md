@@ -12,8 +12,7 @@ settings only on:
 - **how much of the genome stays callable**: more data means more chance of discovery
 - **whether every pool is called at the same sites**: uneven missingness between pools
   looks like differentiation
-- **whether the statistics depend on technical covariates**: θπ, Watterson's θ, Tajima's
-  D and FST should not track read depth, depth imbalance between pools, or the callable
+- **whether the statistics depend on technical covariates**: θπ, Watterson's θ and FST should not track read depth, depth imbalance between pools, or the callable
   fraction of a window. When they do, the filter is letting artefact through.
 
 Each filter is loosened as far as it can go without adding such a dependence, compared
@@ -30,7 +29,7 @@ with the strictest setting tried.
 | `variance` | – | **What kind of depth variation there is**: per-base spread against pure read-sampling noise, how much of the variance persists in 1 kb and 10 kb means (regional blocks vs scattered noise), and, for the sites a lower bound would cut, whether they lie in blocks and whether they are low in one pool only (population divergence, deletions) or in most pools (reference, technical). Also the 1 kb depth correlation between pools. |
 | `quantize`, `depthmask` | mosdepth | Applies the per-pool bounds as BED masks. grenedalf has only one global depth filter, so per-pool bounds have to go in as masks. `shared` mode (default) merges them, so every pool is called at exactly the same sites. `per-sample` keeps more sites at the cost of uneven missingness; the grid tests both. |
 | `pilot` | grenedalf | The whole genome with the recommended settings. **Linkage scale** (`ld`): how far apart two SNPs have to be before their allele frequencies vary independently across pools (an LD decay for pool-seq, no phasing needed). **Window width**: wide enough for `TARGET_SNPS` SNPs in 90% of windows, and no narrower than the linkage scale. Also checks that grenedalf applied the mask the right way round. |
-| `grid` | grenedalf | The whole genome rerun with one setting changed at a time: minimum count ±1, lower and upper depth folds, per-sample masks, and no accessibility mask. `assess` scores each run, and the most permissive run that adds no artefact is recommended. |
+| `grid` | grenedalf | The whole genome rerun with one setting changed at a time: minimum count ±1, lower and upper depth folds, fitted bounds, per-sample masks (and both together), and, as a check, no accessibility mask. `assess` compares each run with the reference run (the one keeping least data), **statistic by statistic**: a run is accepted only if none of θπ, θW or FST depends more on depth, depth imbalance or callable fraction than in the reference, beyond a tolerance. Then `combine` builds one more run from the best accepted choice of each setting, judged by the same rule. The accepted run keeping the most data (SNPs usable per pair of pools, counted the same way for every run) is recommended. |
 | `params` | – | `OUT/params.sh`, and `OUT/grenedalf_commands.sh`: ready-to-run grenedalf commands with every chosen value filled in, one run per chromosome class (nuclear, or autosomes + X, plus mitochondrion). |
 | `report` | – | `OUT/optimiser_report.html`: every step's results on one page (see below). |
 
@@ -109,13 +108,23 @@ is about ten genome-wide grenedalf diversity + FST runs, so it is the slow step
 
 ### How the grid affects the recommendation
 
-The grid decides the **minimum count**, the **depth bounds** (lower and upper fold, or fitted to each pool's coverage)
-and the **mask mode** (shared or per sample). The recommended setting is one of the grid runs,
-and `params.sh`, `grenedalf_commands.sh` and the report all use that run. If a looser
-minimum count or wider depth bounds add no artefact, they replace the starting values,
-because they keep more data. If they do add artefact, the starting values stand. The
-`no_accessibility_mask` run is a check, not a candidate: it shows what the mask removes
-and is only chosen if the mask turns out not to matter.
+The grid decides the **minimum count**, the **depth bounds** (lower and upper fold, or fitted
+to each pool's coverage) and the **mask mode** (shared or per sample). It is a controlled
+experiment: from a baseline, one setting changes at a time, and each run is scored on
+
+- **data kept**: SNPs usable per pair of pools, the data FST works with, counted the same
+  way whatever the mask mode (grenedalf's own totals count a site if any pool can use it,
+  which would flatter per-sample masks);
+- **artefact**: for θπ, θW and FST separately, how strongly the statistic follows read depth,
+  depth imbalance between the pools of a pair, and the callable fraction of each window.
+  None of these should matter.
+
+The reference is the run keeping least data. A run is accepted only if **no statistic** gets
+more dependent on any covariate than in the reference, beyond the tolerance (0.05), so an
+improvement in θπ cannot hide a deterioration in FST. The best accepted choice of each setting
+is then combined into one more run and judged the same way. Of all accepted runs, the one
+keeping the most data is recommended, and `params.sh`, `grenedalf_commands.sh` and the report
+use it. `no_accessibility_mask` is a check, never recommended: it shows what the mask does.
 
 The grid does **not** change the accessibility mask, the window width (from SNP
 density and the linkage scale), the X / mitochondrion decision, or the read filters
@@ -174,12 +183,9 @@ These depend on grenedalf behaviour that could not be tested here (written again
 
 ## Limits
 
-- **Tajima's D needs a minimum count of exactly 2** in grenedalf (Kofler et al.'s
-  correction assumes singletons are removed). When the recommended minimum count is not 2,
-  θπ, θW and FST use the recommended count, and Tajima's D gets its own diversity run at 2
-  (`grenedalf_commands.sh` writes both). Grid runs with a count other than 2 leave
-  Tajima's D out of the artefact score.
-
+- **Tajima's D is not computed**, in the grid or in `grenedalf_commands.sh` (`--no-tajima-d`):
+  grenedalf computes it only with a minimum count of exactly 2, which would mean a different
+  filter from the other statistics.
 - The depth bounds use mosdepth depth (MAPQ filtered, not base-quality filtered), so they
   sit a few percent above grenedalf's own depth at the same site.
 - mosdepth writes its depth distribution to two decimals. Medians are reliable, but the

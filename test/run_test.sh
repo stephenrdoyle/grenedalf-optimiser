@@ -75,7 +75,7 @@ awk -F'\t' 'NR>1 && $1=="poolA_L3" && $2=="X" && $4 >= 26 && $4 <= 34 {ok=1} END
     || fail "poolA X median not ~30 (0.75 x 40)"
 grep -q "OK: grenedalf masked" "$D/optimiser.windows.txt" || fail "mask orientation check"
 grep -q "RECOMMENDED_RUN=clean" "$D/optimiser.assess.params" || fail "assess should prefer the clean run"
-awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 && $1=="artefact" {exit !($h["artefact_vs_strict"] > 0.2)}' \
+awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR>1 && $1=="artefact" {exit !($h["max_increase"] > 0.2)}' \
     "$D/optimiser.assess_runs.tsv" || fail "artefact run not scored worse than the clean run"
 [[ $(wc -l < "$D/persample.sample_masks.tsv") -eq 6 ]] || fail "per-sample mask list"
 # Simulated LD scale is 2 kb (correlation exp(-d/2000)): r2 excess should be gone by a few kb
@@ -104,11 +104,10 @@ for run in autosomes X mito; do
 done
 grep -q -- "--pool-sizes $D/optimiser.x_pool_sizes.tsv" "$D/grenedalf_commands.sh" || fail "X run without X pool sizes"
 bash -n "$D/grenedalf_commands.sh" || fail "grenedalf_commands.sh is not valid bash"
-# min count 3: theta pi / Watterson without Tajima's D, and a separate Tajima's D run at count 2
-grep -q -- "--no-tajima-d" "$D/grenedalf_commands.sh" || fail "diversity at min count 3 without --no-tajima-d"
-awk '/file-prefix autosomes_tajimas_d_/ {t=1} END {exit !t}' "$D/grenedalf_commands.sh" || fail "no separate Tajima's D run"
-awk 'BEGIN {RS=""} /tajimas_d_/ && !/--filter-sample-min-count 2 / {bad=1} END {exit bad}' "$D/grenedalf_commands.sh" \
-    || fail "Tajima's D run not at min count 2"
+# No Tajima's D: every diversity command has --no-tajima-d, and there is no separate Tajima's D run
+[[ $(grep -c "grenedalf diversity" "$D/grenedalf_commands.sh") -eq $(grep -c -- "--no-tajima-d" "$D/grenedalf_commands.sh") ]] \
+    || fail "a diversity command computes Tajima's D"
+! grep -q "tajimas_d" "$D/grenedalf_commands.sh" || fail "separate Tajima's D run in the commands"
 
 # Impossible X ratio (X depth above autosomes, as on reference-divergent real data): flagged,
 # and 0.5 assumed rather than "no males"

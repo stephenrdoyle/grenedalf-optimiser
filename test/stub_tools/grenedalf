@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Stand-in for grenedalf 0.6.3: --help lists the options the driver checks; commands copy the
 # simulated "clean" tables, or the simulated frequency table. Like the real one, diversity
-# refuses Tajima's D unless --filter-sample-min-count is 2 (or --no-tajima-d is given).
+# refuses Tajima's D unless --filter-sample-min-count is 2 (or --no-tajima-d is given), and
+# checks that total and per-sample masks agree.
 set -euo pipefail
 if [[ ${1:-} == --version ]]; then echo "grenedalf v0.6.3 (stand-in)"; exit 0; fi
 cmd=$1; shift
@@ -38,8 +39,26 @@ if [[ $cmd == diversity && $no_tajima == 0 && $mc != 2 ]]; then
     echo "--filter-sample-min-count: Tajima's D requires the minimum allele count to be exactly 2" >&2
     exit 1
 fi
+# Usable SNPs per pair scale with how much the masks leave (as in a real run), so runs that
+# mask less keep more data; the statistics themselves are the simulated "clean" ones
+scale_pairs() {
+    python3 - "$1" "$2" "$total" "$samples" "$mc" <<'PY'
+import sys, pandas as pd
+src, dst, total, samples, mc = sys.argv[1:6]
+bp = lambda f: sum(int(l.split("\t")[2]) - int(l.split("\t")[1]) for l in open(f) if l.strip())
+masked = bp(total) if total else 0
+if samples:
+    beds = [l.split("\t")[1].strip() for l in open(samples) if l.strip()]
+    masked += sum(bp(b) for b in beds) / max(len(beds), 1) / 3   # per-sample: a pair loses less
+t = pd.read_csv(src, sep="\t")
+for c in [c for c in t.columns if ":" in c and c.endswith(".passed")]:
+    # a lower minimum count keeps more SNPs
+    t[c] = (t[c] * 1e6 / (1e6 + masked) * (1 + 0.1 * (3 - int(mc or 3)))).round().astype(int)
+t.to_csv(dst, sep="\t", index=False)
+PY
+}
 case $cmd in
     diversity) cp "$SIM_DIR/clean.diversity.csv" "$out/diversity.csv" ;;
-    fst) cp "$SIM_DIR/clean.fst.csv" "$out/fst.csv" ;;
+    fst) scale_pairs "$SIM_DIR/clean.fst.csv" "$out/fst.csv" ;;
     frequency) gzip -c "$SIM_DIR/frequency.csv" > "$out/frequency.csv.gz" ;;
 esac
