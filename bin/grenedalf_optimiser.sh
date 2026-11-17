@@ -569,7 +569,8 @@ step_grid() {
     # Each run: name, min count, lower fold, upper fold, mask mode, accessibility mask, bound method,
     # smoothing (bp, 0 = per base), setting
     runs+=("default $mc $MIN_FOLD $MAX_FOLD shared $m fold 0 baseline")
-    if [[ $mc -gt 1 ]]; then runs+=("min_count_$((mc - 1)) $((mc - 1)) $MIN_FOLD $MAX_FOLD shared $m fold 0 count"); fi
+    # the error-model count is a floor: the grid cannot see sequencing errors (their false SNPs do
+    # not follow depth), so it would always favour a lower count; only a higher one is tried
     runs+=("min_count_$((mc + 1)) $((mc + 1)) $MIN_FOLD $MAX_FOLD shared $m fold 0 count")
     for f in ${GRID_MIN_FOLDS//,/ }; do runs+=("min_fold_$f $mc $f $MAX_FOLD shared $m fold 0 lower"); done
     for f in ${GRID_MAX_FOLDS//,/ }; do runs+=("max_fold_$f $mc $MIN_FOLD $f shared $m fold 0 upper"); done

@@ -798,7 +798,8 @@ def section_min_count(P):
     d, f = mp.get("DIVERSITY_MIN_COUNT"), mp.get("FST_MIN_COUNT", mp.get("MIN_COUNT"))
     used = (f"{d} for diversity and {f} for FST" if d and f and d != f else (f or d))
     used_txt = (f" The count used is <strong>{used}</strong>: the error model's count is where the default "
-                "run starts, and the filter grid tries one count below and one above it." if used else "")
+                "run starts and is a floor: the filter grid tries one count above it, never below, because "
+                "false SNPs from sequencing errors do not follow depth, so the grid cannot see them." if used else "")
     return ("<section><h2>Minimum allele count</h2>"
             f"<p>Expected sites per Mb where sequencing errors alone give at least <em>c</em> reads of one "
             f"non-reference base, at each pool's median depth and the error rate implied by the base-quality "
