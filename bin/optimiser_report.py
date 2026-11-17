@@ -1124,6 +1124,25 @@ def section_grid(P):
         blocks.append(f"<h3>{esc(TARGETS[t][0].upper() + TARGETS[t][1:])}: <strong>{esc(rec.replace('_', ' '))}</strong></h3>"
                       f"<p>Data kept: {esc(metric_label.get(metric, metric).lower())}.</p>" + combo_html + legend
                       + f'<div class="grid2"><div>{left}</div><div>{right}</div></div>' + delta_html)
+    # FST not judged: its dependence on the covariates is shown for information only
+    if "fst" not in targets and deltas is not None:
+        fcols = [c for c in deltas.columns if c.startswith("fst.rho_")
+                 and (not judged or "rho_" + c.split(".rho_")[1] in judged)]
+        if fcols:
+            ft = deltas[["run"] + fcols].copy()
+            ft.columns = ["run"] + [nice(c) for c in fcols]
+            rec = chosen_runs(P)["fst"] or ref_run
+            blocks.append(
+                f"<h3>FST (per pair of pools): <strong>{esc(rec.replace('_', ' '))}</strong>, not judged</h3>"
+                "<p>FST uses the settings chosen for diversity. It is not judged, because a real difference "
+                "between pools in a region where every pool has low depth (divergent haplotypes that map poorly) "
+                "makes FST follow depth and callable fraction across the genome just as an artefact would, so a "
+                "single region can reject every setting that keeps it. The change in FST's dependence on each "
+                "covariate is shown for information (JUDGE_FST=1 in the config judges it, with its own choice).</p>"
+                + heat_table(ft, list(ft.columns[1:]), lambda v: f"{v:+.2f}",
+                             vmax=max(float(np.nanmax(np.clip(ft.iloc[:, 1:].to_numpy(dtype=float), 0, None))),
+                                      tol if np.isfinite(tol) else 0, 0.05),
+                             scale=lambda v: max(v, 0.0), pick_row=lambda r, rec=rec: r["run"] == rec))
 
     cov_cols = [c for c in runs.columns if ".rho_" in c]
     heat = runs[["run"] + cov_cols].copy()
@@ -1150,8 +1169,9 @@ def section_grid(P):
             "would penalise keeping those regions. Each run is compared with the default settings "
             f"(<strong>{esc(ref_run.replace('_', ' '))}</strong>), statistic by statistic: it is accepted if no "
             "statistic's dependence on any covariate rises by more than the tolerance, and of the accepted runs the "
-            "one keeping the most data is chosen. Diversity and FST are separate grenedalf runs, so each gets its "
-            "own choice.</p>"
+            "one keeping the most data is chosen. "
+            + ("Diversity and FST are separate grenedalf runs, so each gets its own choice.</p>" if "fst" in targets
+               else "The choice is made on diversity, a within-pool measure, and FST uses the same settings.</p>")
             + failed_html + "".join(blocks)
             + "<details><summary>Median |ρ| of each run, every covariate (absolute depth reported, not judged)</summary>"
             + heat_table(heat, list(heat.columns[1:]), lambda v: f"{v:.2f}",

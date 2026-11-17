@@ -46,6 +46,8 @@ LD_MAX_DIST=100000
 
 FST_METHOD=unbiased-nei
 TOLERANCE=0.05       # rise in a statistic's dependence on a technical covariate, over the default run, still accepted
+JUDGE_FST=0          # 0: settings chosen on diversity (within-pool) statistics only, and FST uses them too, because a
+                     # real FST peak in a low-depth region looks like a depth artefact; 1: FST judged, with its own choice
 
 # Tools: the conda environment from environment.yml (bin/grenedalf_optimiser.sh CONFIG setup)
 # is activated by every step. CONDA_ENV=none uses whatever is on PATH, e.g. farm modules.

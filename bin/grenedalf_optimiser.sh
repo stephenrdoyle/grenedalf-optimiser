@@ -78,6 +78,7 @@ LD_MAX_DIST=100000
 PILOT_WINDOW=5000
 FST_METHOD=unbiased-nei
 TOLERANCE=0.05
+JUDGE_FST=0   # 1: FST statistics also judged, with their own choice
 GRENEDALF=grenedalf
 MOSDEPTH=mosdepth
 SAMTOOLS=samtools
@@ -547,6 +548,7 @@ grid_assess() {
     [[ ${#a[@]} -gt 0 ]] || { echo "every grid run failed: see $g/failed_runs.tsv" >&2; exit 1; }
     for n in "${NAMES[@]}"; do a+=(--depth "$n" "$OUT/depth/$n.mq$MAPQ.regions.bed.gz"); done
     "${OPTIMISER[@]}" assess "${a[@]}" --reference default --check-run no_accessibility_mask \
+        --judge "diversity$([[ $JUDGE_FST == 1 ]] && echo ,fst)" \
         --min-snps "$MIN_SNPS" --tolerance "$TOLERANCE" --out "$P"
 }
 
@@ -594,10 +596,12 @@ step_grid() {
     for spec in "${runs[@]}"; do grid_run "$spec"; done
     grid_assess
 
-    # For diversity and for FST: the best accepted choice of each setting together, judged by
-    # the same rules. The FST one is skipped if it is the same run as the diversity one.
+    # For each judged target (diversity; FST too with JUDGE_FST=1): the best accepted choice of
+    # each setting together, judged by the same rules. Skipped if it is the same as an existing run.
     local combo target added=0
-    for target in diversity fst; do
+    local targets=(diversity)
+    [[ $JUDGE_FST == 1 ]] && targets+=(fst)
+    for target in "${targets[@]}"; do
         combo=$("${OPTIMISER[@]}" combine --runs "$g/runs.tsv" --assess "$P.assess_runs.tsv" --target "$target")
         if [[ -n "$combo" ]]; then
             grid_run "$combo combination"

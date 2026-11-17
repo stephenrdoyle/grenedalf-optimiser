@@ -40,9 +40,9 @@ awk -F'\t' 'NR > 1 && $1 == "default" {d = $2} NR > 1 && d && $2 < d {bad = 1} E
 for r in relative_bounds relative_bounds_per_sample; do
     grep -q "^$r"$'\t' "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: $r run missing" >&2; exit 1; }
 done
-# Per-statistic judging, separately for diversity and FST: the check run is never chosen;
-# a combination run is built and judged for each
-for t in diversity fst; do
+# Judged on diversity only (JUDGE_FST=0): the check run is never chosen; a combination run is
+# built and judged; FST takes the diversity choice
+for t in diversity; do
     awk -F'\t' -v t="$t" 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} $1=="no_accessibility_mask" && $h["recommended_" t]=="True" {bad=1} END {exit bad}' \
         "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: check run chosen for $t" >&2; exit 1; }
 done
@@ -54,10 +54,15 @@ grep -q "^combined_" "$D/runs.txt" || { echo "FAIL: no combination run" >&2; exi
 for t in DIVERSITY FST; do
     grep -q "^RECOMMENDED_RUN_$t=" "$D/driver/optimiser.assess.params" || { echo "FAIL: no $t choice" >&2; exit 1; }
 done
+[[ $(grep "^RECOMMENDED_RUN_FST=" "$D/driver/optimiser.assess.params" | cut -d= -f2) == \
+   $(grep "^RECOMMENDED_RUN_DIVERSITY=" "$D/driver/optimiser.assess.params" | cut -d= -f2) ]] \
+    || { echo "FAIL: FST not given the diversity choice" >&2; exit 1; }
+grep -q "^combined_fst" "$D/runs.txt" && { echo "FAIL: combined_fst built with FST not judged" >&2; exit 1; }
+grep -q "not judged" "$D/driver/optimiser_report.html" || { echo "FAIL: report does not say FST is not judged" >&2; exit 1; }
 grep -q "^DIVERSITY_MIN_COUNT=" "$D/driver/params.sh" && grep -q "^FST_MIN_COUNT=" "$D/driver/params.sh" \
     || { echo "FAIL: params.sh without per-statistic settings" >&2; exit 1; }
-awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR==2 {exit !($h["data_metric_fst"]=="pair_snps" && $h["data_metric_diversity"]=="pool_snps")}' \
-    "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: data kept not per pair (fst) and per pool (diversity)" >&2; exit 1; }
+awk -F'\t' 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} NR==2 {exit !($h["data_metric_diversity"]=="pool_snps")}' \
+    "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: data kept not per pool (diversity)" >&2; exit 1; }
 grep -q "by 5 Mb block\|by 1 Mb block" "$D/driver/optimiser_report.html" || { echo "FAIL: no masking-by-region table" >&2; exit 1; }
 # No Tajima's D anywhere in the grid
 ! grep -q "tajimas_d" "$D/driver/optimiser.assess_stats.tsv" || { echo "FAIL: Tajima's D assessed" >&2; exit 1; }

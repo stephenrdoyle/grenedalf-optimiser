@@ -49,7 +49,15 @@ r=()
 for p in "${POOLS[@]}"; do r+=(--depth "$p" "$D/$p.mq30.regions.bed.gz"); done
 "${OPTIMISER[@]}" assess --run clean "$D/clean.diversity.csv" "$D/clean.fst.csv" \
     --run artefact "$D/artefact.diversity.csv" "$D/artefact.fst.csv" "${r[@]}" \
-    --reference clean --min-snps 20 --out "$D/optimiser"
+    --reference clean --judge diversity,fst --min-snps 20 --out "$D/optimiser"
+# default: only diversity is judged, and FST takes the diversity choice
+"${OPTIMISER[@]}" assess --run clean "$D/clean.diversity.csv" "$D/clean.fst.csv" \
+    --run artefact "$D/artefact.diversity.csv" "$D/artefact.fst.csv" "${r[@]}" \
+    --reference clean --min-snps 20 --out "$D/divonly" > /dev/null
+grep -q "^JUDGED_TARGETS=diversity$" "$D/divonly.assess.params" || fail "default assess judges more than diversity"
+[[ $(grep "^RECOMMENDED_RUN_FST=" "$D/divonly.assess.params" | cut -d= -f2) == \
+   $(grep "^RECOMMENDED_RUN_DIVERSITY=" "$D/divonly.assess.params" | cut -d= -f2) ]] || fail "FST not given the diversity choice"
+head -1 "$D/divonly.assess_runs.tsv" | grep -q "acceptable_fst" && fail "FST judged by default"
 
 v=()
 for p in "${POOLS[@]}"; do v+=(--depth "$p" "$D/$p.mq30.regions.bed.gz" --dist "$p" "$D/$p.mosdepth.region.dist.txt"); done

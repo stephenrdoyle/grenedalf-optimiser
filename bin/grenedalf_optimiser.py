@@ -1615,13 +1615,17 @@ def cmd_assess(args):
     runs_df["role"] = np.where(runs_df["run"].isin(checks), "check",
                                np.where(runs_df["run"] == ref_run, "reference", "candidate"))
 
-    # Diversity (theta per pool) and FST (per pair) are separate grenedalf runs, so each gets
-    # its own settings: judged on its own statistics, with data kept counted the way that
-    # statistic uses it. A run is accepted for a target if none of the target's statistics
-    # depends on any judged covariate more than in the reference run (the default
-    # settings) by over --tolerance; of the accepted runs, the one keeping most data wins.
+    # A run is accepted for a target if none of the target's statistics depends on any judged
+    # covariate more than in the reference run (the default settings) by over --tolerance; of
+    # the accepted runs, the one keeping most data wins, with data kept counted the way that
+    # statistic uses it. By default only diversity is judged and FST uses the same run: a
+    # real FST peak in a region of low depth (divergent haplotypes) correlates with depth
+    # across the genome, so FST cannot tell a depth artefact from a real signal.
+    judge = [t for t in args.judge.split(",") if t]
     chosen = {}
     for target, (types, metrics) in TARGETS.items():
+        if target not in judge:
+            continue
         cols = [c for c in metric_cols if c.split(".rho_")[0] in types and "rho_" + c.split(".rho_")[1] in judged]
         if not cols:
             continue
@@ -1640,23 +1644,27 @@ def cmd_assess(args):
         best = cand["run"].iloc[key.index(max(key))] if key else ref_run  # ties: first run listed
         runs_df[f"recommended_{target}"] = runs_df["run"] == best
         chosen[target] = best
+    for target in TARGETS:
+        chosen.setdefault(target, chosen.get(judge[0], ref_run))
 
     runs_df.to_csv(f"{args.out}.assess_runs.tsv", sep="\t", index=False)
     deltas.to_csv(f"{args.out}.assess_deltas.tsv", sep="\t", index=False)
     stats_df.round(4).to_csv(f"{args.out}.assess_stats.tsv", sep="\t", index=False)
-    for target in chosen:
+    for target in judge:
         show = ["run", "role", f"data_kept_{target}", f"max_increase_{target}", f"max_increase_on_{target}",
                 f"acceptable_{target}", f"recommended_{target}"]
         print(f"\n{target}:")
         print(runs_df[show].to_string(index=False))
     print(f"\nreference run: {ref_run}; judged on {', '.join(judged)}; tolerance {args.tolerance}")
     for target, best in chosen.items():
-        print(f"{target}: most data without any {target} statistic getting worse: {best}")
+        how = (f"most data without any {target} statistic getting worse" if target in judge
+               else f"not judged; the {judge[0]} choice")
+        print(f"{target}: {how}: {best}")
     with open(f"{args.out}.assess.params", "w") as fh:
         for target, best in chosen.items():
             fh.write(f"RECOMMENDED_RUN_{target.upper()}={best}\n")
         fh.write(f"RECOMMENDED_RUN={chosen.get('fst', ref_run)}\nTOLERANCE={args.tolerance}\n"
-                 f"REFERENCE_RUN={ref_run}\nJUDGED_COVARIATES={','.join(judged)}\n")
+                 f"REFERENCE_RUN={ref_run}\nJUDGED_COVARIATES={','.join(judged)}\nJUDGED_TARGETS={','.join(judge)}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1908,6 +1916,9 @@ def main():
     p.add_argument("--covariates", default="rho_rel_depth,rho_depth_imbalance,rho_callable",
                    help="covariates judged, comma separated, from " + ", ".join(COVARIATES)
                    + " [rho_rel_depth,rho_depth_imbalance,rho_callable]")
+    p.add_argument("--judge", default="diversity", choices=["diversity", "diversity,fst", "fst,diversity"],
+                   help="statistics that decide the choice; any not judged uses the first one's choice "
+                        "[diversity]")
     p.add_argument("--check-run", action="append", help="run evaluated but never recommended (e.g. no mask)")
     p.add_argument("--tolerance", type=float, default=0.05,
                    help="largest increase, on any statistic and judged covariate, over the reference run [0.05]")
