@@ -1618,9 +1618,10 @@ def cmd_assess(args):
     # A run is accepted for a target if none of the target's statistics depends on any judged
     # covariate more than in the reference run (the default settings) by over --tolerance; of
     # the accepted runs, the one keeping most data wins, with data kept counted the way that
-    # statistic uses it. By default only diversity is judged and FST uses the same run: a
-    # real FST peak in a region of low depth (divergent haplotypes) correlates with depth
-    # across the genome, so FST cannot tell a depth artefact from a real signal.
+    # statistic uses it. By default only diversity is judged and FST keeps the reference
+    # (default) settings: FST follows depth for technical reasons (an allele below the minimum
+    # count is zeroed in a shallow pool but kept in a deep one) and for real ones (a peak in a
+    # region of low depth), and the two cannot be told apart from the data alone.
     judge = [t for t in args.judge.split(",") if t]
     chosen = {}
     for target, (types, metrics) in TARGETS.items():
@@ -1645,7 +1646,7 @@ def cmd_assess(args):
         runs_df[f"recommended_{target}"] = runs_df["run"] == best
         chosen[target] = best
     for target in TARGETS:
-        chosen.setdefault(target, chosen.get(judge[0], ref_run))
+        chosen.setdefault(target, ref_run)
 
     runs_df.to_csv(f"{args.out}.assess_runs.tsv", sep="\t", index=False)
     deltas.to_csv(f"{args.out}.assess_deltas.tsv", sep="\t", index=False)
@@ -1658,7 +1659,7 @@ def cmd_assess(args):
     print(f"\nreference run: {ref_run}; judged on {', '.join(judged)}; tolerance {args.tolerance}")
     for target, best in chosen.items():
         how = (f"most data without any {target} statistic getting worse" if target in judge
-               else f"not judged; the {judge[0]} choice")
+               else "not judged; the reference settings")
         print(f"{target}: {how}: {best}")
     with open(f"{args.out}.assess.params", "w") as fh:
         for target, best in chosen.items():
@@ -1917,7 +1918,7 @@ def main():
                    help="covariates judged, comma separated, from " + ", ".join(COVARIATES)
                    + " [rho_rel_depth,rho_depth_imbalance,rho_callable]")
     p.add_argument("--judge", default="diversity", choices=["diversity", "diversity,fst", "fst,diversity"],
-                   help="statistics that decide the choice; any not judged uses the first one's choice "
+                   help="statistics that decide the choice; any not judged keeps the reference run "
                         "[diversity]")
     p.add_argument("--check-run", action="append", help="run evaluated but never recommended (e.g. no mask)")
     p.add_argument("--tolerance", type=float, default=0.05,

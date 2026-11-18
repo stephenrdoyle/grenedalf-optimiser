@@ -374,9 +374,11 @@ def section_summary(P, out_dir):
     if runs["fst"] and runs["diversity"] == runs["fst"]:
         tiles.append(tile("Grid choice", runs["fst"].replace("_", " "), "for diversity and FST"))
     else:
+        judged_t = read_params(f"{P}.assess.params").get("JUDGED_TARGETS", "diversity,fst").split(",")
         for t, lab in (("diversity", "Diversity settings"), ("fst", "FST settings")):
             if runs[t]:
-                tiles.append(tile(lab, runs[t].replace("_", " "), "grid run, chosen for these statistics"))
+                tiles.append(tile(lab, runs[t].replace("_", " "), "grid run, chosen for these statistics"
+                                  if t in judged_t else "default settings, not judged"))
     body = f'<div class="tiles">{"".join(tiles)}</div>'
 
     thr = read_tsv(f"{P}.depth_thresholds.tsv")
@@ -1134,11 +1136,13 @@ def section_grid(P):
             rec = chosen_runs(P)["fst"] or ref_run
             blocks.append(
                 f"<h3>FST (per pair of pools): <strong>{esc(rec.replace('_', ' '))}</strong>, not judged</h3>"
-                "<p>FST uses the settings chosen for diversity. It is not judged, because a real difference "
-                "between pools in a region where every pool has low depth (divergent haplotypes that map poorly) "
-                "makes FST follow depth and callable fraction across the genome just as an artefact would, so a "
-                "single region can reject every setting that keeps it. The change in FST's dependence on each "
-                "covariate is shown for information (JUDGE_FST=1 in the config judges it, with its own choice).</p>"
+                "<p>FST keeps the default settings. It is not judged, because its dependence on depth mixes "
+                "artefact and real signal: a minimum count applied within each pool zeroes an allele in a shallow "
+                "pool but keeps it in a deep one, raising FST where depth is low, while a real difference between "
+                "pools in a region where every pool has low depth (divergent haplotypes that map poorly) does the "
+                "same, and the data alone cannot tell them apart. Settings that keep more low-depth sites make "
+                "FST follow depth more. The change in FST's dependence on each covariate is shown for information "
+                "(JUDGE_FST=1 in the config judges it, with its own choice).</p>"
                 + heat_table(ft, list(ft.columns[1:]), lambda v: f"{v:+.2f}",
                              vmax=max(float(np.nanmax(np.clip(ft.iloc[:, 1:].to_numpy(dtype=float), 0, None))),
                                       tol if np.isfinite(tol) else 0, 0.05),

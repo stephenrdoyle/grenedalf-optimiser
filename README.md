@@ -18,7 +18,7 @@ settings only on:
 
 Each filter is loosened as far as it can go without adding such a dependence, compared
 with the default settings. The choice is made on diversity (θπ, θW), which is measured within
-each pool, and FST uses the same settings (see below for why FST is not judged).
+each pool; FST keeps the default settings (see below for why FST is not judged).
 
 ## What it does
 
@@ -31,7 +31,7 @@ each pool, and FST uses the same settings (see below for why FST is not judged).
 | `variance` | – | **What kind of depth variation there is**: per-base spread against pure read-sampling noise, how much of the variance persists in 1 kb and 10 kb means (regional blocks vs scattered noise), and, for the sites a lower bound would cut, whether they lie in blocks and whether they are low in one pool only (population divergence, deletions) or in most pools (reference, technical). Also the 1 kb depth correlation between pools. |
 | `quantize`, `depthmask` | mosdepth | Applies the per-pool bounds as BED masks. grenedalf has only one global depth filter, so per-pool bounds have to go in as masks. `shared` mode (default) merges them, so every pool is called at exactly the same sites. `per-sample` keeps more sites at the cost of uneven missingness; the grid tests both. |
 | `pilot` | grenedalf | The whole genome with the recommended settings. **Linkage scale** (`ld`): how far apart two SNPs have to be before their allele frequencies vary independently across pools (an LD decay for pool-seq, no phasing needed). **Window width**: wide enough for `TARGET_SNPS` SNPs in 90% of windows, and no narrower than the linkage scale. Also checks that grenedalf applied the mask the right way round. |
-| `grid` | grenedalf | The whole genome rerun with one setting changed at a time from the default: minimum count +1 (the error-model count is a floor, since false SNPs from sequencing errors do not follow depth and the grid cannot see them), lower and upper depth folds, fitted bounds, bounds relative to the other pools (`relative_bounds`: a pool is masked where its depth is below MIN_FOLD × the median of all pools there, so low depth shared by every pool, usually divergent and often diverse regions, is kept above an absolute floor of REL_FLOOR_FOLD × median), per-sample masks (and each with fitted or relative bounds), depth judged on 100 bp blocks (`smoothed_masks`), and, as a check, no accessibility mask. `assess` compares each run with the default run, **statistic by statistic**, on diversity (θπ, θW per pool): a run is accepted only if none of the statistics depends more on relative depth or callable fraction than in the default run, beyond a tolerance. Then `combine` builds one more run from the best accepted choices, judged by the same rule. The accepted run keeping the most data is chosen, for diversity and FST alike. FST's dependence is reported, not judged (`JUDGE_FST=1` judges it, with its own choice). |
+| `grid` | grenedalf | The whole genome rerun with one setting changed at a time from the default: minimum count +1 (the error-model count is a floor, since false SNPs from sequencing errors do not follow depth and the grid cannot see them), lower and upper depth folds, fitted bounds, bounds relative to the other pools (`relative_bounds`: a pool is masked where its depth is below MIN_FOLD × the median of all pools there, so low depth shared by every pool, usually divergent and often diverse regions, is kept above an absolute floor of REL_FLOOR_FOLD × median), per-sample masks (and each with fitted or relative bounds), depth judged on 100 bp blocks (`smoothed_masks`), and, as a check, no accessibility mask. `assess` compares each run with the default run, **statistic by statistic**, on diversity (θπ, θW per pool): a run is accepted only if none of the statistics depends more on relative depth or callable fraction than in the default run, beyond a tolerance. Then `combine` builds one more run from the best accepted choices, judged by the same rule. The accepted run keeping the most data is chosen for diversity; FST keeps the default settings, and its dependence is reported, not judged (`JUDGE_FST=1` judges it, with its own choice). |
 | `params` | – | `OUT/params.sh`, and `OUT/grenedalf_commands.sh`: ready-to-run grenedalf commands with every chosen value filled in, the diversity and FST commands each with their own settings, one run per chromosome class (nuclear, or autosomes + X, plus mitochondrion). |
 | `report` | – | `OUT/optimiser_report.html`: every step's results on one page (see below). |
 
@@ -137,15 +137,20 @@ improvement in θπ cannot hide a deterioration in θW, or in any one pool. (An 
 least data as the reference; that run is the most heavily filtered and so has the least
 dependence, which made every other run fail and recommended discarding a third of the data.)
 
-**FST is not judged by default.** A real difference between pools in a region where every pool
-has low depth (typically divergent haplotypes, which map poorly) makes FST follow depth and
-callable fraction across the genome exactly as a depth artefact would. A single such region,
-around 4% of the windows, can shift a genome-wide rank correlation by about 0.1, enough to reject
-every setting that keeps it. Diversity is measured within each pool, so it has no such
-confound with differences between pools. The settings are therefore chosen on diversity, and FST
-uses them too; FST's dependence on each covariate is still reported for every run. With
-`JUDGE_FST=1`, FST is judged as well and gets its own choice (`combined_fst`): per-pool masks can
-suit θ while FST, which compares two pools at the same sites, may then get the shared mask.
+**FST is not judged by default, and keeps the default settings** (shared mask, fixed-fold depth
+bounds, the error-model minimum count). FST's dependence on depth mixes artefact and real
+signal. grenedalf applies the minimum count within each pool, so at low or unequal depth an
+allele can be counted in the deeper pool and zeroed in the shallower one, an artificial
+frequency difference that raises FST where depth is low; settings that keep more low-depth
+sites make this stronger. A real difference between pools in a region where every pool has low
+depth (typically divergent haplotypes, which map poorly) also makes FST follow depth. The data
+alone cannot separate the two, so the tool does not tune FST on them: it keeps the standard
+settings and reports FST's dependence on each covariate for every run, so the residual
+dependence can be stated. Diversity is measured within each pool and has neither problem. Regions
+of shared low depth are better studied with depth itself (relative depth between pools tracks
+the frequency of a poorly mapping haplotype) or by mapping to a reference that contains the
+divergent haplotype. With `JUDGE_FST=1`, FST is judged as well and gets its own choice
+(`combined_fst`).
 
 The best accepted choice of each setting is combined into one more run (`combined_diversity`)
 and judged the same way, and the accepted run keeping the most data is chosen. `params.sh`,

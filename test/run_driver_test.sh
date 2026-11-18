@@ -41,7 +41,7 @@ for r in relative_bounds relative_bounds_per_sample; do
     grep -q "^$r"$'\t' "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: $r run missing" >&2; exit 1; }
 done
 # Judged on diversity only (JUDGE_FST=0): the check run is never chosen; a combination run is
-# built and judged; FST takes the diversity choice
+# built and judged; FST keeps the default run
 for t in diversity; do
     awk -F'\t' -v t="$t" 'NR==1 {for (i=1;i<=NF;i++) h[$i]=i} $1=="no_accessibility_mask" && $h["recommended_" t]=="True" {bad=1} END {exit bad}' \
         "$D/driver/optimiser.assess_runs.tsv" || { echo "FAIL: check run chosen for $t" >&2; exit 1; }
@@ -54,9 +54,8 @@ grep -q "^combined_" "$D/runs.txt" || { echo "FAIL: no combination run" >&2; exi
 for t in DIVERSITY FST; do
     grep -q "^RECOMMENDED_RUN_$t=" "$D/driver/optimiser.assess.params" || { echo "FAIL: no $t choice" >&2; exit 1; }
 done
-[[ $(grep "^RECOMMENDED_RUN_FST=" "$D/driver/optimiser.assess.params" | cut -d= -f2) == \
-   $(grep "^RECOMMENDED_RUN_DIVERSITY=" "$D/driver/optimiser.assess.params" | cut -d= -f2) ]] \
-    || { echo "FAIL: FST not given the diversity choice" >&2; exit 1; }
+grep -q "^RECOMMENDED_RUN_FST=default$" "$D/driver/optimiser.assess.params" \
+    || { echo "FAIL: FST does not keep the default run" >&2; exit 1; }
 grep -q "^combined_fst" "$D/runs.txt" && { echo "FAIL: combined_fst built with FST not judged" >&2; exit 1; }
 grep -q "not judged" "$D/driver/optimiser_report.html" || { echo "FAIL: report does not say FST is not judged" >&2; exit 1; }
 grep -q "^DIVERSITY_MIN_COUNT=" "$D/driver/params.sh" && grep -q "^FST_MIN_COUNT=" "$D/driver/params.sh" \
